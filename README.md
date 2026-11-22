@@ -25,7 +25,27 @@ A 股三阶段策略 + 小资金执行层 + 周度模拟盘 + 决策/复盘编�
 
 ## 安装
 
-本仓库是一个 **DSH（DeepSeek Harness）技能**，默认安装到 DSH 的技能目录（Windows `%USERPROFILE%\.dsh\skills\invest`，macOS/Linux `~/.dsh/skills/invest`）：
+本仓库是一个 **DSH（DeepSeek Harness）技能**，默认安装到 DSH 的技能目录（Windows `%USERPROFILE%\.dsh\skills\invest`，macOS/Linux `~/.dsh/skills/invest`）。
+
+### 一键安装（推荐；agent 可直接执行）
+
+Windows（PowerShell 5.1+）：
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/blz89/invest-skill/main/install.ps1)))
+```
+
+macOS / Linux：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/blz89/invest-skill/main/install.sh | bash
+```
+
+脚本一次做完：克隆/更新仓库 → 建 `stock/.venv` → 装依赖（`requirements.txt` + `pip install -e stock` + `pypdf`）→ 跑 `scripts/selftest_all.py --fast` 离线自检（失败返回非 0，可直接 fail-closed）。
+
+可选项：Windows 用参数 `-Dir <目录>` / `-Ref <分支或 tag>` / `-SkipTest`；macOS/Linux 用环境变量 `INVEST_SKILL_DIR` / `INVEST_SKILL_REF` / `INVEST_SKILL_SKIP_TEST=1`。
+
+### 手动安装
 
 ```powershell
 git clone https://github.com/blz89/invest-skill "$env:USERPROFILE\.dsh\skills\invest"
@@ -35,6 +55,7 @@ cd "$env:USERPROFILE\.dsh\skills\invest"
 python -m venv stock\.venv
 stock\.venv\Scripts\python.exe -m pip install -r requirements.txt
 stock\.venv\Scripts\python.exe -m pip install -e .\stock
+stock\.venv\Scripts\python.exe -m pip install pypdf
 ```
 
 下文用 **`<本技能目录>`** 指代这个安装目录。不装 DSH 也能直接跑全部脚本（只是少了 20:00 巡检 / 周六决策那两条会话编排）；取数用的环境变量（`A_SHARE_WORKDIR`、`FUYAO_API_KEY` 等）见下文「环境」一节。
