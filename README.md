@@ -229,6 +229,14 @@ invest/
   - 选源规则、已知限制、还缺什么：`references/data-sources.md`
 - 某个数字怎么算出来的：`references/logic-map.md`
 
+## 密钥与隐私
+
+本仓库**不含任何个人凭据**：
+
+- 需要 key 的数据源只从环境变量或仓库外文件读取（同花顺：`FUYAO_API_KEY`，或 `$WORK_DIR/fuyao.key`），仓库里只有变量名与用法说明。
+- `ledger/`、`stock/data/`、`stock/.venv/`、`out/`、`*.key`、`.env*` 都是本地运行时产物，已被 `.gitignore` 排除。
+- `stock/stock/endpoints/em.py` 中有三处东方财富公开网页接口的固定参数（`token` / `ut`，与 akshare 相同的公共常量），用于签公开行情请求，**不是个人凭据**；删掉会导致对应接口不可用。
+
 ## 五层结构
 
 | 层 | 做什么 | 在哪看阈值 |
