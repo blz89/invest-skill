@@ -58,7 +58,7 @@ if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Forc
 
 if (Test-Path (Join-Path $Dir '.git')) {
     Write-Step "Updating existing checkout at $Dir"
-    & git -C $Dir fetch --depth 1 origin $Ref
+    & git -C $Dir fetch --depth 1 $RepoUrl $Ref
     if ($LASTEXITCODE -ne 0) { Stop-Install "git fetch failed (ref: $Ref)" }
     & git -C $Dir checkout -q FETCH_HEAD
     if ($LASTEXITCODE -ne 0) { Stop-Install 'git checkout failed' }

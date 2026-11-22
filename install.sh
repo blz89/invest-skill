@@ -44,7 +44,7 @@ mkdir -p "$(dirname "$DIR")"
 
 if [ -d "$DIR/.git" ]; then
   log "Updating existing checkout at $DIR"
-  git -C "$DIR" fetch --depth 1 origin "$REF" || die "git fetch failed (ref: $REF)"
+  git -C "$DIR" fetch --depth 1 "$REPO" "$REF" || die "git fetch failed (ref: $REF)"
   git -C "$DIR" checkout -q FETCH_HEAD || die "git checkout failed"
 else
   if [ -e "$DIR" ]; then
