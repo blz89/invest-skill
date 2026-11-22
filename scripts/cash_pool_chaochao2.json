@@ -1,0 +1,509 @@
+{
+ "source": "招行 App 朝朝盈2号 产品明细（2026-11-15 截图录入）",
+ "rule": "每支每日快赎 1 万元；智能转入按 7日年化 从高到低每支填 1 万",
+ "funds": [
+  {
+   "app_name": "博时合晶货币B",
+   "app_yield": 1.4,
+   "code": "004985"
+  },
+  {
+   "app_name": "中银机构现金管理A",
+   "app_yield": 1.36,
+   "code": "002195"
+  },
+  {
+   "app_name": "国投瑞银增利宝货币A",
+   "app_yield": 1.34,
+   "code": "000868"
+  },
+  {
+   "app_name": "创金合信货币C",
+   "app_yield": 1.34,
+   "code": "007866"
+  },
+  {
+   "app_name": "博时合鑫B",
+   "app_yield": 1.34,
+   "code": "003206"
+  },
+  {
+   "app_name": "国富安享货币B",
+   "app_yield": 1.34,
+   "code": "004120"
+  },
+  {
+   "app_name": "海富通添益货币B",
+   "app_yield": 1.33,
+   "code": "004771"
+  },
+  {
+   "app_name": "建信天添益货币A",
+   "app_yield": 1.32,
+   "code": "003391"
+  },
+  {
+   "app_name": "国泰货币B",
+   "app_yield": 1.29,
+   "code": "020032"
+  },
+  {
+   "app_name": "广发添利货币B",
+   "app_yield": 1.29,
+   "code": "005107"
+  },
+  {
+   "app_name": "建信货币B",
+   "app_yield": 1.29,
+   "code": "003185"
+  },
+  {
+   "app_name": "招商招禧宝货币B",
+   "app_yield": 1.28,
+   "code": "004262"
+  },
+  {
+   "app_name": "南方收益宝B",
+   "app_yield": 1.28,
+   "code": "202308"
+  },
+  {
+   "app_name": "永赢天天利货币A",
+   "app_yield": 1.28,
+   "code": "004545"
+  },
+  {
+   "app_name": "中欧货币D",
+   "app_yield": 1.27,
+   "code": "002748"
+  },
+  {
+   "app_name": "博时兴荣货币B",
+   "app_yield": 1.27,
+   "code": "004282"
+  },
+  {
+   "app_name": "富国安益货币A",
+   "app_yield": 1.27,
+   "code": "000602"
+  },
+  {
+   "app_name": "中银如意宝A",
+   "app_yield": 1.27,
+   "code": "004502"
+  },
+  {
+   "app_name": "银华活钱宝F",
+   "app_yield": 1.26,
+   "code": "000662"
+  },
+  {
+   "app_name": "银华惠增利货币A",
+   "app_yield": 1.26,
+   "code": "000860"
+  },
+  {
+   "app_name": "华安现金宝货币B",
+   "app_yield": 1.26,
+   "code": "000874"
+  },
+  {
+   "app_name": "长城收益宝C",
+   "app_yield": 1.26,
+   "code": "016778"
+  },
+  {
+   "app_name": "华夏沃利货币B",
+   "app_yield": 1.26,
+   "code": "002937"
+  },
+  {
+   "app_name": "汇添富收益快钱货币D",
+   "app_yield": 1.25,
+   "code": "013003"
+  },
+  {
+   "app_name": "易方达天天理财货币D",
+   "app_yield": 1.25,
+   "code": "000010"
+  },
+  {
+   "app_name": "平安财富宝货币A",
+   "app_yield": 1.25,
+   "code": "000759"
+  },
+  {
+   "app_name": "兴业安润货币A",
+   "app_yield": 1.25,
+   "code": "004216"
+  },
+  {
+   "app_name": "银华多利宝B",
+   "app_yield": 1.25,
+   "code": "000605"
+  },
+  {
+   "app_name": "南方天天宝B",
+   "app_yield": 1.25,
+   "code": "004971"
+  },
+  {
+   "app_name": "华夏惠利货币D",
+   "app_yield": 1.24,
+   "code": "004251"
+  },
+  {
+   "app_name": "汇添富货币E",
+   "app_yield": 1.24,
+   "code": "519517"
+  },
+  {
+   "app_name": "博时合利货币B",
+   "app_yield": 1.24,
+   "code": "002960"
+  },
+  {
+   "app_name": "嘉实快线货币A",
+   "app_yield": 1.24,
+   "code": "000917"
+  },
+  {
+   "app_name": "华泰柏瑞天添宝B",
+   "app_yield": 1.24,
+   "code": "003871"
+  },
+  {
+   "app_name": "华夏快线货币B",
+   "app_yield": 1.23,
+   "code": null
+  },
+  {
+   "app_name": "兴全货币B",
+   "app_yield": 1.22,
+   "code": "004417"
+  },
+  {
+   "app_name": "国投瑞银钱多宝货币A",
+   "app_yield": 1.22,
+   "code": "000836"
+  },
+  {
+   "app_name": "博时外服货币B",
+   "app_yield": 1.22,
+   "code": "001308"
+  },
+  {
+   "app_name": "平安金管家货币A",
+   "app_yield": 1.21,
+   "code": "003465"
+  },
+  {
+   "app_name": "中欧骏泰货币B",
+   "app_yield": 1.21,
+   "code": "004039"
+  },
+  {
+   "app_name": "建信现金添益A",
+   "app_yield": 1.21,
+   "code": "003022"
+  },
+  {
+   "app_name": "大成恒丰宝货币E",
+   "app_yield": 1.2,
+   "code": "001698"
+  },
+  {
+   "app_name": "华泰紫金天天金货币ETFB",
+   "app_yield": 1.2,
+   "code": "004749",
+   "fuzzy": true
+  },
+  {
+   "app_name": "鹏扬通利货币E",
+   "app_yield": 1.2,
+   "code": null
+  },
+  {
+   "app_name": "嘉实增益宝货币A",
+   "app_yield": 1.2,
+   "code": "004173"
+  },
+  {
+   "app_name": "大成添利宝货币C",
+   "app_yield": 1.2,
+   "code": "000726"
+  },
+  {
+   "app_name": "招商招利宝货币B",
+   "app_yield": 1.19,
+   "code": "003538"
+  },
+  {
+   "app_name": "博时兴盛货币B",
+   "app_yield": 1.18,
+   "code": "004060"
+  },
+  {
+   "app_name": "招商招金宝B",
+   "app_yield": 1.17,
+   "code": "000651"
+  },
+  {
+   "app_name": "东方红货币E",
+   "app_yield": 1.16,
+   "code": "005058"
+  },
+  {
+   "app_name": "汇添富和聚宝货币C",
+   "app_yield": 1.16,
+   "code": "016096"
+  },
+  {
+   "app_name": "浦银日日鑫B",
+   "app_yield": 1.15,
+   "code": "003229"
+  },
+  {
+   "app_name": "华安现金富利货币B",
+   "app_yield": 1.15,
+   "code": "041003"
+  },
+  {
+   "app_name": "民生加银腾元宝货币D",
+   "app_yield": 1.15,
+   "code": "018331"
+  },
+  {
+   "app_name": "富国天时B",
+   "app_yield": 1.14,
+   "code": "100028"
+  },
+  {
+   "app_name": "建信现金增利货币A",
+   "app_yield": 1.14,
+   "code": null
+  },
+  {
+   "app_name": "招商保证金快线D",
+   "app_yield": 1.12,
+   "code": "011258"
+  },
+  {
+   "app_name": "永赢货币A",
+   "app_yield": 1.12,
+   "code": "000533"
+  },
+  {
+   "app_name": "银华惠添益货币C",
+   "app_yield": 1.12,
+   "code": "001101"
+  },
+  {
+   "app_name": "华泰柏瑞交易货币C",
+   "app_yield": 1.12,
+   "code": "012841"
+  },
+  {
+   "app_name": "富国收益宝B",
+   "app_yield": 1.11,
+   "code": "001982",
+   "fuzzy": true
+  },
+  {
+   "app_name": "兴全天添益货币A",
+   "app_yield": 1.1,
+   "code": "001820"
+  },
+  {
+   "app_name": "兴业鑫天盈货币A",
+   "app_yield": 1.1,
+   "code": "001925"
+  },
+  {
+   "app_name": "国寿安保增金宝B",
+   "app_yield": 1.09,
+   "code": "009790"
+  },
+  {
+   "app_name": "融通汇财宝货币E",
+   "app_yield": 1.09,
+   "code": "004399"
+  },
+  {
+   "app_name": "大成慧成货币E",
+   "app_yield": 1.09,
+   "code": "002201"
+  },
+  {
+   "app_name": "广发活期宝货币C",
+   "app_yield": 1.09,
+   "code": "000748"
+  },
+  {
+   "app_name": "中金现金管家B",
+   "app_yield": 1.09,
+   "code": "000883"
+  },
+  {
+   "app_name": "工银薪金货币C",
+   "app_yield": 1.08,
+   "code": "000716"
+  },
+  {
+   "app_name": "前海开源聚财宝A",
+   "app_yield": 1.07,
+   "code": "004368"
+  },
+  {
+   "app_name": "国富日日收益货币A",
+   "app_yield": 1.06,
+   "code": "000203"
+  },
+  {
+   "app_name": "招商招益宝A",
+   "app_yield": 1.06,
+   "code": "003388"
+  },
+  {
+   "app_name": "国寿安保鑫钱包B",
+   "app_yield": 1.05,
+   "code": "011063"
+  },
+  {
+   "app_name": "兴业稳天盈货币A",
+   "app_yield": 1.04,
+   "code": "002912"
+  },
+  {
+   "app_name": "长城工资宝C",
+   "app_yield": 1.04,
+   "code": "010051"
+  },
+  {
+   "app_name": "广发货币C",
+   "app_yield": 1.04,
+   "code": "005092"
+  },
+  {
+   "app_name": "博时合惠货币A",
+   "app_yield": 1.03,
+   "code": "004137"
+  },
+  {
+   "app_name": "摩根天添盈货币E类",
+   "app_yield": 1.03,
+   "code": "000857"
+  },
+  {
+   "app_name": "中信保诚智惠金货币A",
+   "app_yield": 1.03,
+   "code": "024984"
+  },
+  {
+   "app_name": "南方天天利A",
+   "app_yield": 1.02,
+   "code": "003473"
+  },
+  {
+   "app_name": "鹏华兴鑫宝货币A",
+   "app_yield": 1.02,
+   "code": "014610"
+  },
+  {
+   "app_name": "国寿安保薪金宝货币B",
+   "app_yield": 1.02,
+   "code": "017880"
+  },
+  {
+   "app_name": "工银瑞信如意货币A",
+   "app_yield": 1.01,
+   "code": null
+  },
+  {
+   "app_name": "平安日鑫C",
+   "app_yield": 1.01,
+   "code": "015021"
+  },
+  {
+   "app_name": "华夏货币A",
+   "app_yield": 1.0,
+   "code": "288101"
+  },
+  {
+   "app_name": "浦银日日丰A",
+   "app_yield": 1.0,
+   "code": "003534"
+  },
+  {
+   "app_name": "光大货币C",
+   "app_yield": 0.99,
+   "code": null
+  },
+  {
+   "app_name": "建信现金添利货币A",
+   "app_yield": 0.99,
+   "code": null
+  },
+  {
+   "app_name": "中银证券现金管家A",
+   "app_yield": 0.99,
+   "code": "003316"
+  },
+  {
+   "app_name": "招商招福宝货币A",
+   "app_yield": 0.98,
+   "code": "002298"
+  },
+  {
+   "app_name": "鹏华聚财通货币",
+   "app_yield": 0.97,
+   "code": null
+  },
+  {
+   "app_name": "泰康现金管家货币D",
+   "app_yield": 0.97,
+   "code": "004861"
+  },
+  {
+   "app_name": "中信建投凤凰货币C",
+   "app_yield": 0.97,
+   "code": "001006"
+  },
+  {
+   "app_name": "华夏现金宝A",
+   "app_yield": 0.91,
+   "code": "001077"
+  },
+  {
+   "app_name": "中银活期宝货币A",
+   "app_yield": 0.91,
+   "code": "000539"
+  },
+  {
+   "app_name": "中信保诚薪金宝货币E",
+   "app_yield": 0.89,
+   "code": null
+  },
+  {
+   "app_name": "安信活期宝货币A",
+   "app_yield": 0.87,
+   "code": "003402"
+  },
+  {
+   "app_name": "浦银日日盈货币E",
+   "app_yield": 0.85,
+   "code": "519568"
+  },
+  {
+   "app_name": "嘉实活期宝货币A",
+   "app_yield": 0.82,
+   "code": "000464"
+  },
+  {
+   "app_name": "招商现金增值A",
+   "app_yield": 0.72,
+   "code": "217004"
+  }
+ ],
+ "note": "旧口径（2026-11-15 从招行 App 产品明细录入）。2026-11-19 用户 m01594 起默认不再用它：cash_pool.py 默认 --universe market 排全市场货基；本文件只作 --universe chaochao2 的回滚/对照。"
+}

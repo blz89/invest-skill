@@ -1,0 +1,35 @@
+name: selftest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # 自检一律走离线口径（只读缓存、缺了就报错）：CI 上没有本机缓存，
+      # 开着联网模式会去撞已失效的数据源，跑到超时
+      A_SHARE_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install -U pip
+          pip install -e ./stock
+          pip install pypdf baostock
+
+      - name: 投资技能离线自检（23 套）
+        run: python scripts/selftest_all.py --fast
+
+      - name: 数据引擎单元测试
+        working-directory: stock
+        run: python -m unittest discover -s stock/tests

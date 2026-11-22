@@ -1,0 +1,28 @@
+# 数据与缓存不进版本库
+data/
+!data/.gitkeep
+
+# 凭据
+*.key
+env*.local
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 系统
+Thumbs.db
+.DS_Store
+
+# 一次性迁移/对比脚本（结论已写进 README 与 tests）
+tmp/
+
+
+# 运行时产物
+daily/
+etf_spot_tx/
+*.log
