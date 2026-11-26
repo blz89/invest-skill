@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import atexit
+import shutil
 import os
 import sys
 import tempfile
@@ -50,6 +52,7 @@ def _doc():
 
 print("1) 归档：stage2_detail.json → out/archive/scoring/<date>.csv")
 tmp = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, tmp, ignore_errors=True)
 _orig_out = config.OUT_DIR
 config.OUT_DIR = tmp
 try:
@@ -82,6 +85,7 @@ finally:
 
 print("3) load_panel：多日合并去重")
 d = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, d, ignore_errors=True)
 try:
     for day, codes in (("2026-01-02", ["000001", "600000"]), ("2026-01-09", ["000001"])):
         pd.DataFrame([{"date": day, "code": c, "name": c, "verdict": "观察", "total": 60,

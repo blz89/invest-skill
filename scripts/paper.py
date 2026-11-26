@@ -323,8 +323,8 @@ def _bracket_children(state: dict, parent_id: str) -> list:
 def bracket_order(state: dict, parent: dict, as_of: str = None) -> dict | None:
     """给一张计划买入配保护止损（括号单）：买入成交后才激活，未成交则一直冻结。
 
-    为什么需要（2026-11-07 B 类 #10）：决策日下单 + 周度结算之间有一周空窗，买入若在
-    周三成交、下周六才跑 stop_orders，周三到周五跌破止损也没人管。括号单在**下单时**
+    为什么需要（2026-11-07 B 类 #10）：决策日下单、次一交易日的巡检会话才结算，中间有空窗；买入若在
+    次一交易日成交、再到下一个巡检日才跑 stop_orders，这段跌破止损也没人管。括号单在**下单时**
     就把止损挂上，成交即生效，把空窗填掉。
 
     约束：只在父单有 `stop_price` 时生成；一个父单只配一张；`limit_price` 先取父单的
@@ -1232,9 +1232,8 @@ def cash_yield_plan(state: dict, close_map: dict = None, container: str = None,
         零头留朝朝宝（不再绑招行朝朝盈2号那 100 支）。
 
     为什么 T+0 部分要留够：
-      决策在**周六**、买单周一生效，而场外货基周末不能赎回（普通赎回 T+1，周一赎回
-      周二才到账；快赎要人手动操作且未必赶得上开盘）。所以「可能变成买单的钱」必须
-      周一就在券商账户——权益上限与现有权益之间的差额一律留 T+0 工具。
+      决策在周三/周六、买单次一交易日生效，而场外货基赎回 T+1（快赎要人手动操作且未必赶得上开盘）。
+      所以「可能变成买单的钱」必须决策日次一交易日前就在券商账户——权益上限与现有权益之间的差额一律留 T+0 工具。
       权益上限优先取参数 `cap_amount`，其次取账本 `meta["equity_cap"]`（周报每期写入）；
       都没有则按 0 处理（旧账本，行为与改动前一致）。
 
@@ -1489,14 +1488,15 @@ def accrue_cash_lots(state: dict, as_of: str, calendar) -> float:
     mf_rate = float(plan["money_fund_rate"])
     fee_rate = float(plan["repo_fee_rate"])
     disc = float(plan.get("repo_commission_discount", 1.0))
-    _cash_name = plan.get("cash_side_name") or "货基"
+    _cash_name = str(plan.get("cash_side_name") or "货基").strip()
     hist = state.setdefault("repo_history", [])
-    gross = fee = 0.0
+    gross = fee = repo_it = 0.0
+    mf_it = 0.0
     term_rates = {int(k): float(v) for k, v in ((CFG.get("cash_yield") or {})
                                                .get("term_fee_rates") or {}).items()}
 
     def realize(lot):
-        nonlocal gross, fee
+        nonlocal gross, fee, repo_it
         # 本金取 lot 自己记的金额：现金容器可能已从逆回购切到货基，但在途 lot 仍按
         # 买入时的本金到期兑现（否则切容器那一刻利息会凭空变大/变小）。
         amt = round(float(lot.get("amount") or repo_amt), 2)
@@ -1505,6 +1505,7 @@ def accrue_cash_lots(state: dict, as_of: str, calendar) -> float:
         fr = term_rates.get(term, fee_rate)
         fe = round(amt * fr * disc, 4)
         gross += it
+        repo_it += it
         fee += fe
         hist.append({"date": lot["buy"], "kind": "repo", "mature": lot["mature"],
                      "days": lot["days"], "term": term, "amount": amt,
@@ -1589,6 +1590,7 @@ def accrue_cash_lots(state: dict, as_of: str, calendar) -> float:
                 rate_gaps += 1
             bal += bal * r / 365.0
         it = round(bal - mf_amt, 4)
+        mf_it = it
         gross += it
         hist.append({"date": str(as_of), "kind": "mf", "mature": "",
                      "days": int(days_all), "amount": round(mf_amt, 2),
@@ -1632,20 +1634,31 @@ def accrue_cash_lots(state: dict, as_of: str, calendar) -> float:
         return 0.0
     state["cash"] = _money(float(state["cash"]) + net)
     state.setdefault("cash_marks", {})["last_accrued"] = str(as_of)
+
+    def _realized_ann(it: float, amt: float) -> float:
+        """实得年化：本窗口实收利息 ÷ 本金 ÷ 天数 × 365（真实入账口径，不是预测/标签）。"""
+        return (it * 365.0 / (amt * days_all)) if (amt > 0 and days_all > 0) else 0.0
+
+    _segs = []
     if sleeve_amt > 0:
         _stale_note = ("（排行过期，沿用最后持仓）"
                        if (plan.get("sleeve_stale") or plan.get("sleeve_degraded")) else "")
-        detail = (f"现金层计息 {days_all} 天：半流动性 {sleeve_amt:,.0f} 元"
-                  f"@{sleeve_rate:.2%}（{len(holds)} 支货基，逐日万份收益"
-                  + (f"；{len(pool_missing)} 支缺数未计" if pool_missing else "")
-                  + _stale_note
-                  + f"）+ {_cash_name} {mf_amt:,.2f} 元@{mf_rate:.1%}（逐日利率）"
-                  f" − 手续费 {fee:.2f} 元 = {net:+.2f} 元")
-    else:
-        detail = (f"现金层计息 {days_all} 天：逆回购 {repo_amt:,.0f} 元"
-                  f"（{len([h for h in sched if h['mature'] <= str(as_of)])} 笔已到期 + 1 笔在途）"
-                  f"@{rate:.1%} + {_cash_name} {mf_amt:,.2f} 元@{mf_rate:.1%}"
-                  f" − 手续费 {fee:.2f} 元 = {net:+.2f} 元")
+        _segs.append(
+            f"半流动性 {sleeve_amt:,.0f} 元按逐日万份收益实得 {pool_it:+.2f} 元"
+            f"（实得年化 {_realized_ann(pool_it, sleeve_amt):.2%}；{len(holds)} 支，"
+            f"90 天口径 {sleeve_rate:.2%} 只用于选基、不是计息利率"
+            + (f"；{len(pool_missing)} 支缺数未计" if pool_missing else "")
+            + _stale_note + "）")
+    elif repo_amt > 0 or repo_it:
+        _segs.append(
+            f"逆回购 {repo_amt:,.0f} 元"
+            f"（{len([h for h in sched if h['mature'] <= str(as_of)])} 笔已到期 + 1 笔在途）"
+            f"按 {rate:.2%} 计息实得 {repo_it:+.2f} 元")
+    if mf_amt > 0 and days_all > 0:
+        _segs.append(f"{_cash_name} {mf_amt:,.2f} 元按逐日利率实得 {mf_it:+.2f} 元"
+                     f"（实得年化 {_realized_ann(mf_it, mf_amt):.2%}）")
+    detail = (f"现金层计息 {days_all} 天：" + "；".join(_segs)
+              + f" − 手续费 {fee:.2f} 元 = {net:+.2f} 元")
     event(state, "cash_yield", detail, as_of, amount=net)
     return net
 
@@ -1805,7 +1818,8 @@ def accrue_cash(state: dict, as_of: str, close_map: dict = None,
         return 0.0
     state["cash"] = _money(float(state["cash"]) + net)
     marks["last_accrued"] = str(as_of)
-    detail = (f"现金层计息 {days} 天：逆回购 {repo_amt:,.0f} 元"
+    detail = ("（回滚口径：年化×天数，仅离线/测试使用，线上结算走逐日万份收益/逐日利率）"
+              f"现金层计息 {days} 天：逆回购 {repo_amt:,.0f} 元"
               f"（{plan['repo_lots']} 手 × {1000 if repo_amt == 0 else repo_amt / max(plan['repo_lots'], 1):,.0f} 元）"
               f"@{plan['repo_rate']:.1%} + {plan.get('cash_side_name') or '货基'} "
               f"{mf_amt:,.2f} 元@{plan['money_fund_rate']:.1%}"
@@ -1833,7 +1847,8 @@ def settle(state: dict, as_of: str, close_map: dict, bench_close: float = None) 
     bench_nav = None
     b0 = state["meta"].get("baseline_bench")
     if bench_close and b0:
-        bench_nav = _money(float(state["meta"]["capital"]) * float(bench_close) / float(b0))
+        # A2：基准用「累计投入」而不是当前本金——注资会让本金跳变，基准跟着跳就是假超额。
+        bench_nav = _money(contributed_capital(state) * float(bench_close) / float(b0))
     navs = state.setdefault("nav", [])
     entry = {"date": as_of, "nav": nav, "cash": _money(state["cash"]),
              "market_value": _money(market_value), "otc_value": _money(otc_mv),
@@ -2008,6 +2023,51 @@ def cash_interest_total(state: dict) -> float:
     return round(tot, 2)
 
 
+def capital_flows(state: dict) -> list:
+    """注资现金流（按到账日排序）：``[{date, amount, month}]``。"""
+    out = []
+    for h in ((state.get("meta") or {}).get("capital_history") or []):
+        try:
+            amt = float(h.get("injection") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        day = str(h.get("date") or "")[:10]
+        if amt > 0 and day:
+            out.append({"date": day, "amount": amt, "month": str(h.get("month") or "")})
+    return sorted(out, key=lambda x: x["date"])
+
+
+def initial_capital(state: dict) -> float:
+    """初始本金（首次注资之前的本金）——累计收益的分母基准。"""
+    meta = state.get("meta") or {}
+    for k in ("initial_capital", "bench_baseline_capital", "capital"):
+        if meta.get(k):
+            return float(meta[k])
+    return 0.0
+
+
+def contributed_capital(state: dict) -> float:
+    """累计投入本金 = 初始本金 + Σ注资（不含盈亏）——**收益率/金额的分母**。"""
+    return round(initial_capital(state) + sum(f["amount"] for f in capital_flows(state)), 2)
+
+
+def withdrawn_total(state: dict) -> float:
+    """已划出的年度奖励合计（不是亏损，算收益时要加回来）。"""
+    return round(float(((state.get("meta") or {}).get("withdrawn_total")) or 0.0), 2)
+
+
+def cumulative_pnl(state: dict) -> float:
+    rows = [n for n in (state.get("nav") or []) if n.get("nav") is not None]
+    nav = float(rows[-1]["nav"]) if rows else 0.0
+    contrib = contributed_capital(state)
+    return round(nav + withdrawn_total(state) - contrib, 2) if contrib > 0 else 0.0
+
+
+def cumulative_return(state: dict) -> float | None:
+    contrib = contributed_capital(state)
+    return round(cumulative_pnl(state) / contrib, 8) if contrib > 0 else None
+
+
 def investable_capital(state: dict) -> dict:
     """可投资本 = 账本本金 + 累计**已实现**盈利（用户规则：赚到的钱要再投出去）。
 
@@ -2026,7 +2086,11 @@ def investable_capital(state: dict) -> dict:
     bl = (state["meta"].get("annual_baseline") or {})
     realized0 = round(float(bl.get("realized") or 0.0)
                       + float(bl.get("cash_interest") or 0.0), 2)
-    gain = max(0.0, realized - realized0)           # 只加盈利，亏损不缩本金
+    # A7：动态本金跑过之后（capital_history 非空），meta.capital 每月已更新为
+    # 「上月末净值 + 注资」，盈亏已含在里面；再加一次已实现盈利会把仓位上限放大。
+    # 未启用动态本金的账本仍按旧口径（盈利再投资），那里 capital 不会自动更新。
+    _dyn_active = bool((state.get("meta") or {}).get("capital_history"))
+    gain = 0.0 if _dyn_active else max(0.0, realized - realized0)
     raw = base + gain
     hi = float(config.CAPITAL["max"])
     inv = min(hi, raw)
@@ -2089,7 +2153,7 @@ def portfolio(state: dict, close_map: dict) -> dict:
                      "redeem_fee": r0["redeem_fee"], "hold_days": r0["hold_days"]})
         mv += r0["value"]
     nav = _money(float(state["cash"]) + mv)
-    cap0 = float(state["meta"]["capital"])
+    cap0 = contributed_capital(state) or float(state["meta"]["capital"])
     for r in rows:
         r["weight"] = round(r["value"] / nav, 6) if nav else 0.0
     last_nav = state["nav"][-1]["nav"] if state.get("nav") else nav
@@ -2099,7 +2163,9 @@ def portfolio(state: dict, close_map: dict) -> dict:
     base_idx = float((state.get("meta") or {}).get("cum_index") or 1.0)
     return {"rows": rows, "market_value": _money(mv), "cash": _money(state["cash"]),
             "nav": nav, "last_settled_nav": last_nav,
-            "total_return": round(base_idx * nav / cap0 - 1, 6) if cap0 else None,
+            # 分母已是「累计投入」，cum_index 再乘一次会把历史收益放大一遍（A3）。
+            "total_return": (round((nav + withdrawn_total(state)) / cap0 - 1, 6)
+                             if cap0 else None),
             "bench_return": (round(bench_nav / cap0 - 1, 6)
                              if bench_nav and cap0 else None),
             "drawdown": round(nav / max(n["nav"] for n in state["nav"]) - 1, 6)
@@ -2109,7 +2175,7 @@ def portfolio(state: dict, close_map: dict) -> dict:
 def stats(state: dict) -> dict:
     """绩效统计：总收益、年化、最大回撤、胜率、盈亏比、费用、超额。"""
     navs = state.get("nav", [])
-    cap0 = float(state["meta"]["capital"])
+    cap0 = contributed_capital(state) or float(state["meta"]["capital"])
     if not navs:
         return {"settled": False, "note": "还没有结算记录"}
     peak, mdd = navs[0]["nav"], 0.0
@@ -2119,7 +2185,7 @@ def stats(state: dict) -> dict:
     last = navs[-1]
     days = (dt.date.fromisoformat(last["date"]) - dt.date.fromisoformat(navs[0]["date"])).days
     base_idx = float((state.get("meta") or {}).get("cum_index") or 1.0)
-    total_ret = base_idx * last["nav"] / cap0 - 1
+    total_ret = (last["nav"] + withdrawn_total(state)) / cap0 - 1
     bench_ret = (last["bench_nav"] / cap0 - 1) if last.get("bench_nav") else None
     sells = [t for t in state["trades"] if t["action"] == "sell"]
     wins = [t for t in sells if (t.get("realized_pnl") or 0) > 0]
@@ -2139,7 +2205,8 @@ def stats(state: dict) -> dict:
         "days": days,
         "nav": last["nav"],
         "total_return": round(total_ret, 6),
-        "annualized": (round((base_idx * last["nav"] / cap0) ** (365 / days) - 1, 6)
+        "annualized": (round(((last["nav"] + withdrawn_total(state)) / cap0)
+                             ** (365 / days) - 1, 6)
                        if days >= 1 else None),
         "max_drawdown": round(mdd, 6),
         "bench_return": None if bench_ret is None else round(bench_ret, 6),

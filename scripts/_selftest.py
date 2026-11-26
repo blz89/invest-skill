@@ -15,10 +15,13 @@ import capital as cap  # noqa: E402
 import config  # noqa: E402
 
 FAILED: list[str] = []
+PASSED = 0
 
 
 def check(name: str, cond: bool, detail: str = ""):
+    global PASSED
     if cond:
+        PASSED += 1
         print(f"  ✓ {name}")
     else:
         FAILED.append(name)
@@ -228,7 +231,7 @@ def main():
     if FAILED:
         print(f"✗ 失败 {len(FAILED)} 项：" + "；".join(FAILED))
         raise SystemExit(1)
-    print("✓ 全部通过")
+    print(f"✓ 全部通过（{PASSED} 项断言）")
 
 
 if __name__ == "__main__":

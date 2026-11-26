@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
-"""「执行日」账本结算命令：把上一期挂出的订单按真实日线成交，然后结算净值。
+"""「执行与结算」命令：把已生效且当日触发的挂单按真实日线撮合，然后结算净值。
 
-这是每周四 / 周一早上（或晚上）由执行 agent 跑的那条命令。模拟盘阶段它只做
-「按缓存日线的开盘价/限价/触发价记成交」；将来接券商时，真实下单动作就插在这里
-（paper.apply_fill 换成券商回报），其余账本逻辑不用动。
+每日 20:00 巡检会话的第 2 步跑它（不带 --date）——只撮合「已触发」的条件单：
+止损跌破触发价按触发价、跳空按开盘价卖出；买入限价单触及按限价成交。未触发/未生效
+的挂单一律不动，所以它不是调仓工具。决策日 `weekly.py` 也会撮合一次。将来接券商，
+真实下单动作就插在这里（paper.apply_fill 换成券商回报），其余账本逻辑不用动。
 
 用法：
-  python scripts/paper_exec.py                 # 结算到今天之前最后一个交易日
-  python scripts/paper_exec.py --date 2026-10-26
+  python scripts/paper_exec.py                 # 结算到今天（非交易日退到最近交易日）
+  python scripts/paper_exec.py --date 2026-10-26   # 回溯补跑
   python scripts/paper_exec.py --dry-run       # 只打印会发生什么，不写账本
 """
 import argparse
@@ -24,6 +25,7 @@ import config
 import datasource as ds
 import metrics as mx
 import paper
+import otc_book
 
 CFG = config.PAPER
 PAPER_OUT = CFG["package_dir"]
@@ -115,6 +117,11 @@ def main(argv=None):
     day = args.date or dt.date.today().isoformat()
     as_of = last_trading_day(cal, day)
     print(f"[exec] 结算日 {as_of}（{WEEKDAY[dt.date.fromisoformat(as_of).weekday()]}）")
+    # 场外净值必须先刷新再 settle：patrol.mark_daily 走的是同一入口（otc_book.refresh_navs）。
+    # 以前只有巡检刷场外、本脚本用旧净值，于是同一天两条路径结算出两个 nav（2026-11-24 差 1.80 元）。
+    n_otc = otc_book.refresh_navs(state, as_of)
+    if n_otc:
+        print(f"[exec] 场外净值刷新 {n_otc} 只（与巡检同一入口）")
 
     pending = paper.pending_orders(state)
     etf_codes = {o["code"] for o in pending if o["kind"] == "etf"}
@@ -135,7 +142,7 @@ def main(argv=None):
     else:
         paper.accrue_cash(state, as_of, close_map, calendar=cal)
         paper.settle(state, as_of, close_map, bc)
-        # 成交当天就补上保护性止损单：否则周一成交后要等到下周六 20:00 决策才挂 GTC，
+        # 成交当天就补上保护性止损单：否则成交后要等到下个决策日 20:30 才挂 GTC，
         # 中间两个交易日的盘中跌破没有单子保护。
         new_stops = paper.stop_orders(state, as_of, close_map, atr_map, fill_from=nxt)
         paper.save(state, args.state)

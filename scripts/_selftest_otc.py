@@ -11,6 +11,8 @@
 
 跑法：python scripts/_selftest_otc.py（不联网；只读 out/ 已有产物做一致性检查）
 """
+import atexit
+import shutil
 import os
 import sys
 import tempfile
@@ -21,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config       # noqa: E402
 import datasource as ds  # noqa: E402
+import metrics as m      # noqa: E402
 import otc          # noqa: E402
 
 PASS = 0
@@ -52,7 +55,8 @@ _CONTRACT_COLS = ["code", "name", "ftype", "nav_date", "unit_nav", "acc_nav",
                   "purchase_status", "min_purchase", "day_limit", "fee", "hist_days",
                   "ret_1y", "ret_3y", "dd_1y", "dd_3y", "vol_3y", "mgmt_fee",
                   "redeem_fee_hold", "cost_1y", "score", "level", "level_reason",
-                  "key", "share_class"]
+                  "key", "share_class", "hold_period_days",
+                  "scale_yi", "fwd_net_rate", "fwd_gap_vs_cash"]
 
 
 # ---------------------------------------------------------------- A. 配置可追溯
@@ -213,30 +217,89 @@ def t_dd():
 
 
 # ---------------------------------------------------------------- F. 打分
+plan_fwd = None
+try:                                  # plan.py 是上层编排，import 失败时只跳过这条断言
+    import plan as _plan
+    plan_fwd = _plan._otc_fwd_yield()[0]
+except Exception:                     # noqa: BLE001
+    plan_fwd = None
+
+
 def t_score():
-    print("\n[F] 综合分：0–100、方向正确、可比")
-    best = {"ret_1y": 0.03, "dd_1y": -0.002, "cost_1y": 0.001}
-    worst = {"ret_1y": 0.0, "dd_1y": -0.02, "cost_1y": 0.01}
+    print("\n[F] 综合分：0–100、方向正确、前瞻优先（2026-11-25 B-12）")
+    # 夹具一律从 CFG_O["score_range"] 反推：区间是按实测分布校准的，硬写数值会在下次校准时误伤测试
+    _rg = otc.CFG_O.get("score_range") or {}
+    f_lo, f_hi = [float(x) for x in _rg["fwd_net_rate"]]
+    d_good, d_bad = [float(x) for x in _rg["dd_1y"]]
+    c_lo, c_hi = [float(x) for x in _rg["cost_1y"]]
+    s_lo, s_hi = [float(x) for x in _rg["scale_yi"]]
+    r_lo, r_hi = [float(x) for x in _rg["ret_1y"]]
+    # 满分样本：5 个维度都顶到位
+    best = {"fwd_net_rate": f_hi, "dd_1y": d_good, "cost_1y": c_lo,
+            "scale_yi": s_hi, "ret_1y": r_hi}
+    # 零分样本：每一项都在下限之外（前瞻低于下限、回撤最深、成本最高、规模 0、无收益）
+    worst = {"fwd_net_rate": f_lo - 0.001, "dd_1y": d_bad, "cost_1y": c_hi,
+             "scale_yi": 0.0, "ret_1y": 0.0}
     sb, sw = otc.score_of(best), otc.score_of(worst)
     check("最好样本 = 100 分", abs(sb - 100.0) < 1e-6, str(sb))
     check("最差样本 = 0 分", abs(sw - 0.0) < 1e-6, str(sw))
-    check("分差方向正确（收益高/回撤浅/成本低 得分高）", sb > sw, f"{sb} vs {sw}")
+    check("前瞻区间是按实测分布校准的（下限 ≤0.5%，不是旧口径 1.1%）",
+          f_lo <= 0.005 and f_hi <= 0.02, str((f_lo, f_hi)))
+    check("分差方向正确（前瞻/回撤/成本/规模/收益 全优者高分）", sb > sw, f"{sb} vs {sw}")
 
-    base = {"ret_1y": 0.015, "dd_1y": -0.01, "cost_1y": 0.005}
-    up = dict(base, ret_1y=0.02)
-    check("收益↑ → 分↑", otc.score_of(up) > otc.score_of(base),
-          f"{otc.score_of(up)} vs {otc.score_of(base)}")
-    shallow = dict(base, dd_1y=-0.005)
+    w = otc.CFG_O.get("score") or {}
+    check("权重和 = 100（改口径只调比例，不加总量）",
+          abs(sum(float(v) for v in w.values()) - 100.0) < 1e-6, str(w))
+    check("前瞻净票息是第一大项（≥30）", float(w.get("fwd_net_rate") or 0) >= 30.0, str(w))
+    check("历史 1 年收益不再是主轴（≤15）", float(w.get("ret_1y") or 0) <= 15.0, str(w))
+
+    base = {"fwd_net_rate": (f_lo + f_hi) / 2, "dd_1y": (d_good + d_bad) / 2,
+            "cost_1y": (c_lo + c_hi) / 2, "scale_yi": (s_lo + s_hi) / 2,
+            "ret_1y": (r_lo + r_hi) / 2}
+    for key, val, label in (("fwd_net_rate", f_hi, "前瞻净票息↑"),
+                            ("ret_1y", r_hi, "收益↑"),
+                            ("scale_yi", s_hi, "规模↑")):
+        up = dict(base, **{key: val})
+        check(f"{label} → 分↑", otc.score_of(up) > otc.score_of(base),
+              f"{otc.score_of(up)} vs {otc.score_of(base)}")
+    shallow = dict(base, dd_1y=d_good)
     check("回撤浅 → 分↑", otc.score_of(shallow) > otc.score_of(base),
           f"{otc.score_of(shallow)} vs {otc.score_of(base)}")
-    cheap = dict(base, cost_1y=0.002)
+    cheap = dict(base, cost_1y=c_lo)
     check("成本低 → 分↑", otc.score_of(cheap) > otc.score_of(base),
           f"{otc.score_of(cheap)} vs {otc.score_of(base)}")
-    check("0 ≤ 分 ≤ 100", all(0.0 <= otc.score_of(x) <= 100.0 for x in (best, worst, base)),
-          "越界")
 
+    # 关键回归（B-12 的要点）：016426 那种「历史 5.61%」在旧口径下能拿 40 分，
+    # 新口径下历史项封顶 15 分 —— 光靠后视收益撑不起排名。
+    hist_only = {"fwd_net_rate": f_lo, "dd_1y": d_bad, "cost_1y": c_hi,
+                 "scale_yi": s_lo, "ret_1y": 0.0561}
+    check("历史收益高但前瞻/回撤/成本都差 → 分 ≤15（历史不再是主轴）",
+          otc.score_of(hist_only) <= 15.0 + 1e-6, str(otc.score_of(hist_only)))
+    check("缺前瞻字段（旧产物）不抛异常且该项记 0",
+          isinstance(otc.score_of({"ret_1y": 0.02}), float), "抛异常")
+    # 测试审计 A-6：只断言「是 float」会被任何实现蒙过，钉死精确分值。
+    check("历史收益项精确：0.02/0.05 × 15 分 = 6.0 分",
+          abs(otc.score_of({"ret_1y": 0.02}) - 6.0) < 1e-9,
+          str(otc.score_of({"ret_1y": 0.02})))
+    check("空 dict → 0.0 分（不许拿默认值蒙分）",
+          abs(otc.score_of({})) < 1e-12, str(otc.score_of({})))
+    check("0 ≤ 分 ≤ 100",
+          all(0.0 <= otc.score_of(x) <= 100.0 for x in (best, worst, base)), "越界")
 
-# ---------------------------------------------------------------- G. 风险等级
+    _orig_fby = m.fwd_bond_yield
+    if m.fwd_bond_yield()[0] is None:      # CI 无本机国债缓存 → 注入固定曲线
+        m.fwd_bond_yield = lambda *a, **k: (0.01283, "2026-11-25")
+    fwd, asof = m.fwd_bond_yield()
+    check("前瞻票息可解析（3Y/5Y 国债均值 ∈ 0–10%）且有日期",
+          fwd is not None and 0 < fwd < 0.10 and bool(asof), f"{fwd} asof={asof}")
+    if plan_fwd is None:
+        skip("plan/otc 同一份前瞻票息", "plan 未导入（跳过）")
+    else:
+        check("plan 侧与 otc 侧用的是同一份前瞻票息（不许各写一遍）",
+              abs(float(plan_fwd) - float(fwd or 0.0)) < 1e-9,
+              f"plan={plan_fwd} metrics={fwd}")
+    m.fwd_bond_yield = _orig_fby
+
 def t_level():
     print("\n[G] 风险等级：一律走 risk 模块，不在本文件硬写字符串")
     bond_lv = str((config.RISK.get("etf_map") or {}).get("bond"))
@@ -265,6 +328,42 @@ def t_schema():
           str(otc._COLS))
 
 
+# ---------------------------------------------------------------- H2. 持有期过滤（2026-11-25 A 类）
+def t_hold_period():
+    print("\n[H2] 产品持有期硬过滤（018193「180 天持有期」教训）")
+    check("名称解析：180 天 → 180", m.hold_period_days("建信鑫弘180天持有期债券C") == 180,
+          str(m.hold_period_days("建信鑫弘180天持有期债券C")))
+    check("名称解析：30 天 → 30", m.hold_period_days("建信鑫和30天持有期债券C") == 30)
+    check("名称解析：无持有期条款 → None",
+          m.hold_period_days("永赢中债3-5年政金债指数C") is None,
+          str(m.hold_period_days("永赢中债3-5年政金债指数C")))
+    check("名称解析：中文数字「一年持有」→ 365",
+          m.hold_period_days("某某一年持有期混合") == 365,
+          str(m.hold_period_days("某某一年持有期混合")))
+    # A11：定开/封闭产品名称里常没有「N天持有」，必须 fail-closed 当超长锁定
+    check("A11 「定开」无天数 → 按 3650 天（fail-closed）",
+          m.hold_period_days("鑫元金融债3个月定开") == 3650,
+          str(m.hold_period_days("鑫元金融债3个月定开")))
+    check("A11 「封闭」无天数 → 按 3650 天（fail-closed）",
+          m.hold_period_days("某某两年封闭运作债券") == 3650,
+          str(m.hold_period_days("某某两年封闭运作债券")))
+    cfg_otc = dict((config.RISK.get("wealth") or {}).get("otc") or {})
+    check("config.RISK.wealth.otc.max_hold_period_days 存在且 ≤ 90",
+          0 < int(cfg_otc.get("max_hold_period_days") or 0) <= 90,
+          str(cfg_otc.get("max_hold_period_days")))
+    if os.path.exists(CSV):
+        df = pd.read_csv(CSV, dtype={"code": str})
+        if "hold_period_days" in df.columns:
+            over = df[pd.to_numeric(df["hold_period_days"], errors="coerce")
+                      > int(cfg_otc.get("max_hold_period_days") or 30)]
+            check("产物池里没有持有期 > 上限的基金", len(over) == 0,
+                  f"仍有 {len(over)} 只：{list(over['code'])[:5]}")
+        else:
+            skip("产物池持有期列", "旧产物没有 hold_period_days 列（重跑 otc.py 后生效）")
+    else:
+        skip("产物池持有期列", "没有 stage1_otc.csv")
+
+
 # ---------------------------------------------------------------- I. 缓存往返
 def t_cache():
     print("\n[I] 缓存回读：6 位基金代码不能被 pandas 读成 int（000682 → 682）")
@@ -272,6 +371,7 @@ def t_cache():
         skip("缓存往返", "A_SHARE_FORCE_REFRESH 已开启，会走网络")
         return
     tmp = tempfile.mkdtemp(prefix="otc_selftest_")
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     p = os.path.join(tmp, "money_rank.csv")
     # 模拟「归一化后写进缓存」再被 pandas 读回：整数 682 而非字符串 '000682'
     pd.DataFrame({"code": [682, 2234, 4121], "name": ["甲", "乙", "丙"],
@@ -330,8 +430,18 @@ def t_artifact():
     else:
         skip("漏斗 JSON", f"{fjson} 不存在")
     check("非空", len(df) > 0, "0 行")
-    check("列 = 契约列", list(df.columns) == _CONTRACT_COLS,
+    # 契约列比对允许「旧产物少新列」：2026-11-25 新增 hold_period_days，磁盘上的 CSV 是上一版
+    # otc.py 产物，重跑才会补上。严格相等会让「改了代码还没重跑数据」变成红灯 —— 那属于
+    # 数据新鲜度问题（下面 A 段的 funnel final 会看），不是契约破坏。缺**老列**才是破坏。
+    _new_cols = {"hold_period_days", "scale_yi", "fwd_net_rate", "fwd_gap_vs_cash"}
+    check("列 = 契约列（允许旧产物缺新增列）",
+          list(df.columns) == _CONTRACT_COLS
+          or (set(df.columns) == set(_CONTRACT_COLS) - _new_cols),
           f"差异: {set(df.columns) ^ set(_CONTRACT_COLS)}")
+    if "hold_period_days" not in df.columns:
+        skip("产物持有期列", "旧产物（重跑 otc.py 后补齐；plan 侧已按名称兜底解析）")
+    if "fwd_net_rate" not in df.columns:
+        skip("产物前瞻列", "旧产物（重跑 otc.py 后补齐；plan 侧已按名称兜底解析）")
 
     codes = df["code"].astype(str).tolist()
     check("code 全是 6 位数字（前导零没被吃掉）",
@@ -397,8 +507,20 @@ def t_artifact():
 
 
 # ---------------------------------------------------------------- K. 开关
+def _sig(p):
+    """文件的 (mtime_ns, sha256)；不存在返回 None。用于「测试没写产物」断言。"""
+    import hashlib
+    try:
+        st = os.stat(p)
+        with open(p, "rb") as f:
+            return (st.st_mtime_ns, hashlib.sha256(f.read()).hexdigest())
+    except OSError:
+        return None
+
+
 def t_switch():
     print("\n[K] enabled=False 时必须显式拒绝，而不是静默跑出空池")
+    _before = _sig(CSV)
     old = otc.CFG_O.get("enabled")
     otc.CFG_O["enabled"] = False
     try:
@@ -411,6 +533,9 @@ def t_switch():
     finally:
         otc.CFG_O["enabled"] = old
     check("enabled=False → SystemExit（fail loud）", raised, "没有抛 SystemExit")
+    # 测试审计 A-5：拒绝路径也必须证明没动生产产物（哈希 + mtime 前后相等）
+    check("enabled=False 的 run_screen 不写产物（stage1_otc.csv 哈希/mtime 不变）",
+          _sig(CSV) == _before, f"{_before} -> {_sig(CSV)}")
 
 
 def main():
@@ -424,6 +549,7 @@ def main():
     t_score()
     t_level()
     t_schema()
+    t_hold_period()
     t_cache()
     t_artifact()
     t_switch()

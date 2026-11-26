@@ -11,7 +11,7 @@ from unittest import mock
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # D:\
 
 from stock import cache, codes, config, http, patch  # noqa: E402
 from stock.sources import eastmoney as em  # noqa: E402

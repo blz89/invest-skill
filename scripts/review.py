@@ -164,7 +164,10 @@ def net_metrics(state, st, win, led_cfg, token_cost=None, ledger=None):
     净年化 = 用自然日跨度把净收益率年化（样本不足时仍算，但判定会被样本闸拦住）。
     基准 = `config.PERF.deposit_rate`（1 年期定存/国债口径，见 config 及其 as_of），必须带 as_of。
     """
-    cap = float(led_cfg.get("capital") or (state.get("meta") or {}).get("capital") or 0.0)
+    # A6：金额/收益率的分母用「累计投入」（初始 + Σ注资）；配置本金只作展示。
+    cap = (paper.contributed_capital(state)
+           or float((state.get("meta") or {}).get("capital") or 0.0)
+           or float(led_cfg.get("capital") or 0.0))
     total = st.get("total_return")
     gross_pnl = (total * cap) if (total is not None and cap) else None
     years = None
@@ -189,7 +192,18 @@ def net_metrics(state, st, win, led_cfg, token_cost=None, ledger=None):
         token_spent = float(token_cost)
         token_src = "命令行 --token-cost 覆盖（累计实花）"
 
-    net_pnl = (gross_pnl - token_spent) if gross_pnl is not None else None
+    # A5：token 已从现金扣过时，nav 已是净口径，再减一次就是重复扣。
+    try:
+        import capital_dyn as _cd
+        # 只有在账本真的把 token 记账进净值（大写 meta.token_booked 有记录）时才算「已扣」，
+        # 否则测试/旧账本/未收口月份仍按「毛收益 − token」口径（A5）。
+        _tok_in_nav = bool(_cd.enabled() and _cd.token_from_cash()
+                           and ((state.get("meta") or {}).get("token_booked") or {}))
+        _flows = _cd.flows(state)
+    except Exception:  # noqa: BLE001
+        _cd, _tok_in_nav, _flows = None, False, []
+    net_pnl = (gross_pnl if _tok_in_nav else (gross_pnl - token_spent)) \
+        if gross_pnl is not None else None
     if net_pnl is not None and abs(net_pnl) < 0.005:  # 避免 -0.00 显示噪声
         net_pnl = 0.0
     net_return = (net_pnl / cap) if (net_pnl is not None and cap) else None
@@ -203,6 +217,42 @@ def net_metrics(state, st, win, led_cfg, token_cost=None, ledger=None):
                   and net_ann is not None and net_ann > deposit)
     grade = score.grade_of(net_return) if net_return is not None else None
     reward_open = score.reward_period_open()
+    # ---- 多周期加权评分（2026-11-25 用户拍板：季 50% / 年 20% / 长期 30%，各窗口折年化）----
+    # 为什么放在 net_metrics 里：验收判据只有一处口径，报表/记分卡/HTML 都从这里取，
+    # 免得月报一套、周报一套。窗口 token 成本按 runs 的实际日期落在窗口内求和。
+    multi = None
+    quarter = None
+    try:
+        _as_of = win.get("last") or None
+        _bs = billing.budget_state(ledger or "50k", cap)
+        _runs = _bs.get("runs") or []
+        _w = score.windows_from_nav(state.get("nav") or [], as_of=_as_of,
+                                    runs=_runs, capital=cap, flows=_flows,
+                                    token_in_nav=_tok_in_nav)
+        multi = score.evaluate_multi(_w, deposit_rate=deposit)
+        for _k, _v in (multi.get("terms") or {}).items():
+            _raw = (_w or {}).get(_k) or {}
+            _v["label"] = {"quarter": "季度（12 周滚动）", "year": "年度（52 周滚动）",
+                           "long": "三年（不足则自成立）"}.get(_k, _k)
+            _v["start"] = _raw.get("start")
+            _v["end"] = _raw.get("end")
+            _v["gross_return"] = _raw.get("gross_return")
+            _v["token_cost_cny"] = _raw.get("token_cost_cny")
+    except Exception as exc:  # noqa: BLE001 — 加权评分失败不影响老口径与报表
+        multi = {"error": f"多周期加权评分失败：{exc}"}
+    # ---- 本季累计（B 类 #22 主指标）：季初→as_of，口径与滚动窗口一致 ----
+    try:
+        quarter = score.quarter_metrics(state.get("nav") or [], as_of=win.get("last"),
+                                        runs=_runs, capital=cap, deposit_rate=deposit,
+                                        flows=_flows, token_in_nav=_tok_in_nav)
+        quarter["token_quarter_budget_cny"] = float(
+            (config.PERF or {}).get("token_cost_quarter_cny") or 0.0)
+        _tq = quarter.get("token_cost_cny")
+        _bq = quarter.get("token_quarter_budget_cny")
+        if _tq is not None and _bq:
+            quarter["token_budget_used_pct"] = _tq / _bq
+    except Exception as exc:  # noqa: BLE001 — 季度口径失败不能再把老报表带崩
+        quarter = {"available": False, "note": f"本季口径失败：{exc}"}
     return {
         "capital": cap, "token_spent": round(token_spent, 2),
         "token_cost": round(token_spent, 2),          # 兼容旧字段名
@@ -212,6 +262,14 @@ def net_metrics(state, st, win, led_cfg, token_cost=None, ledger=None):
         "gross_pnl": gross_pnl, "net_pnl": net_pnl, "net_return": net_return,
         "net_annualized": net_ann, "years": years, "bar_ok": bar_ok,
         "grade": grade, "grade_basis": "净收益率（账户收益 − token 实花）/ 本金",
+        "multi": multi,
+        "multi_score_ann": (multi or {}).get("score_ann"),
+        "multi_excess_ann": (multi or {}).get("excess_ann"),
+        "multi_sample_ok": bool((multi or {}).get("sample_ok")),
+        "multi_grade": (multi or {}).get("grade"),
+        "quarter": quarter,
+        "quarter_net_return": (quarter or {}).get("net_return"),
+        "quarter_bar_ok": (quarter or {}).get("bar_ok"),
         "reward_pending": not reward_open,
         "reward_note": (config.SCORE.get("reward_eval_note")
                         if not reward_open else "评估期已到（可按档位计提奖励）"),
@@ -226,25 +284,74 @@ def judge(st, win, excess, mdd, fee_ratio, closed, exp, net=None):
     if closed < MIN_CLOSED:
         lack.append(f"还差 {MIN_CLOSED - closed} 笔平仓")
     if lack:
-        return "样本不足", [f"观察窗 {win['weeks']} 周 / 平仓 {closed} 笔；" + "、".join(lack) + "才能谈期望"]
+        # 样本不足也要把多周期加权摆出来（只显示、不判档），否则用户看不到新口径在跑。
+        reasons = [f"观察窗 {win['weeks']} 周 / 平仓 {closed} 笔；" + "、".join(lack) + "才能谈期望"]
+        multi = (net or {}).get("multi") or {}
+        if multi.get("error"):
+            reasons.append(f"多周期加权：{multi['error']}")
+        elif multi.get("sample_ok") and multi.get("score_ann") is not None:
+            _parts = []
+            for _k in ("quarter", "year", "long"):
+                _t = (multi.get("terms") or {}).get(_k) or {}
+                if _t.get("sample_ok"):
+                    _parts.append(f"{_k} {_pct(_t.get('ann_rate'))}"
+                                  f"（{int(_t.get('days') or 0)} 天，权重 {_t.get('weight_used', 0):.0%}）")
+            reasons.append(f"多周期加权（季50/年20/长期30，各窗口折年化）："
+                           + "｜".join(_parts)
+                           + f" → 加权年化 {_pct(multi.get('score_ann'))}"
+                           f"（无风险基准 {_pct(multi.get('deposit_rate'))}）")
+        elif multi:
+            _t = (multi.get("terms") or {})
+            _shown = "、".join(
+                f"{_k} {int(_v.get('days') or 0)} 天" for _k, _v in _t.items() if _v.get("days"))
+            reasons.append(f"多周期加权（季50/年20/长期30）：窗口 {_shown or '无数据'}，"
+                           f"都还没满 {int(multi.get('min_window_days') or 84)} 天 → 只显示不判档")
+        return "样本不足", reasons
     # 用户验收口径：①赚回 token 钱 ②扣成本后年化 > 银行存款
+    # 2026-11-25 起第②条改成「加权年化」（季 50 / 年 20 / 长期 30，各窗口折年化），
+    # 加权分还没满最小样本（各自 <12 周）时退回老的整段净年化，避免拿 27 天噪声判档。
     bar_bad = []
     if net:
         if net.get("net_pnl") is not None and net["net_pnl"] < 0:
             bar_bad.append(f"累计净利润 {_f(net['net_pnl'])} 元 < 0：token 实花 "
                            f"（{_f(net.get('token_spent'))} 元）还没赚回来")
-        if net.get("net_annualized") is not None and net["net_annualized"] <= net["deposit_rate"]:
+        multi = net.get("multi") or {}
+        if multi.get("sample_ok") and multi.get("score_ann") is not None:
+            if multi["score_ann"] <= net["deposit_rate"]:
+                bar_bad.append(f"加权年化净收益率 {_pct(multi['score_ann'])} "
+                               f"≤ 无风险基准 {_pct(net['deposit_rate'])}"
+                               f"（{net.get('deposit_as_of') or '未标注口径'}；权重 季50/年20/长期30）")
+        elif net.get("net_annualized") is not None and net["net_annualized"] <= net["deposit_rate"]:
             bar_bad.append(f"扣 token 实花后年化 {_pct(net['net_annualized'])} "
                            f"≤ 无风险基准 {_pct(net['deposit_rate'])}"
                            f"（{net.get('deposit_as_of') or '未标注口径'}）"
                            f"；净利润 {_f(net.get('net_pnl'))} 元")
         if bar_bad:
-            return "未达标", bar_bad + ["（用户验收口径：净利润 ≥ 0 且 扣 token 实花后年化 > 无风险利率）"]
+            return "未达标", bar_bad + ["（用户验收口径：净利润 ≥ 0 且 加权年化净收益率 > 无风险利率）"]
     notes = []
     if net:
         notes.append(f"净利润 {_f(net.get('net_pnl'))} 元（token 实花 {_f(net.get('token_spent'))} 元）"
                      f"｜净年化 {_pct(net.get('net_annualized'))} > 无风险基准 "
                      f"{_pct(net.get('deposit_rate'))}（{net.get('deposit_as_of') or '未标注口径'}）")
+        multi = net.get("multi") or {}
+        if multi.get("error"):
+            notes.append(f"多周期加权：{multi['error']}")
+        elif multi.get("sample_ok") and multi.get("score_ann") is not None:
+            _parts = []
+            for _k in ("quarter", "year", "long"):
+                _t = (multi.get("terms") or {}).get(_k) or {}
+                if _t.get("sample_ok"):
+                    _parts.append(f"{_t.get('label') or _k} {_pct(_t.get('ann_rate'))}"
+                                  f"（{int(_t.get('days') or 0)} 天"
+                                  f"{'，自成立' if _t.get('inception') else ''}，"
+                                  f"权重 {_t.get('weight_used', 0):.0%}）")
+            notes.append(f"多周期加权（季50/年20/长期30，各窗口折年化）："
+                         + "｜".join(_parts)
+                         + f" → **加权年化 {_pct(multi.get('score_ann'))}**")
+        else:
+            notes.append(f"多周期加权：{multi.get('note') or '样本不足，只显示不判档'}")
+        if net.get("multi_grade"):
+            notes.append(f"多周期档位 **{net['multi_grade']}**（按加权年化净收益率判）")
         if net.get("grade"):
             notes.append(f"净收益率 {_pct(net.get('net_return'))} → 档位 **{net['grade']}**"
                          f"（按净收益率判，阈值语义不变）")
@@ -310,7 +417,7 @@ def one_ledger(name, led_cfg):
     cash_yield_total = round(sum(float(e.get("amount") or 0.0)
                                  for e in (state.get("events") or [])
                                  if e.get("level") == "cash_yield"), 2)
-    equity_pnl = (round(total * float(led_cfg.get("capital") or 0.0) - cash_yield_total, 2)
+    equity_pnl = (round(total * paper.contributed_capital(state) - cash_yield_total, 2)
                   if total is not None else None)
     net = net_metrics(state, st, win, led_cfg, token_cost=TOKEN_COST_OVERRIDE, ledger=name)
     label, reasons = judge(st, win, excess, mdd, fee_ratio, closed, exp, net=net)
@@ -351,31 +458,57 @@ def one_ledger(name, led_cfg):
     }
 
 
-def to_md(rows, generated):
+_ANNUAL = False   # --annual：年报模式；默认按 config.PERF.grade_period 判（annual → 月报只出数字）
+
+
+def _grade_period() -> str:
+    return str((config.PERF or {}).get("grade_period") or "")
+
+
+def _show_grade(annual=None) -> bool:
+    """档位/奖励是否在本次记分卡里出（2026-11-26 用户拍板：计分放年报）。"""
+    if annual is None:
+        annual = _ANNUAL
+    return bool(annual) if _grade_period() == "annual" else True
+
+
+def to_md(rows, generated, annual=None):
+    _show = _show_grade(annual)
     _dm = deposit_meta()            # 基准 + as_of，缺就抛错（不允许不标口径的判定）
     L = ["# 模拟盘记分卡（累计）", ""]
     L.append(f"生成时间：{generated}｜观察口径：满 {MIN_WEEKS} 周且平仓 ≥{MIN_CLOSED} 笔才判期望")
     L.append("")
-    L.append(f"判定标准（2026-11-07定）：**净利润 = 账户累计收益（元）− token 实花（元）"
+    L.append(f"判定标准（2026-11-25 更新）：**净利润 = 账户累计收益（元）− token 实花（元）"
              f"；token 实花取 out/budget.json 该账本累计 spent（不是年度计提）"
-             f"；①净利润 ≥ 0 ②扣 token 实花后的净年化 > 无风险利率基准 {_pct(_dm['rate'])}"
-             f"（{_dm['as_of'] or '口径未标注'}）；档位按净收益率判，阈值语义不变**。"
-             f"奖励评估期 2027-10-30 起评判，此前一律 0。"
+             f"；①净利润 ≥ 0 ②**加权年化**净收益率 > 无风险利率基准 {_pct(_dm['rate'])}"
+             f"（{_dm['as_of'] or '口径未标注'}）—— 加权口径 = 季度 50% / 年度 20% / 三年 30%，"
+             f"各窗口先折成年化再加权（不足三年时长期项用「自成立」），不满 12 周的窗口只显示不判档"
+             f"；档位按加权年化净收益率判，阈值语义不变**。"
+             f"**主指标 = 本季累计净收益率**（vs 季达标线 = 年化达标线/4 = "
+             f"{_pct(((config.PERF or {}).get('accept_quarter_rate')))}"
+             f"{(lambda _c: f'，5 万本金 ≈ {_c:,.0f} 元/季')(50000 * float(((config.PERF or {}).get('accept_quarter_rate')) or 0))}"
+             f"；token 季度预算 {_f((config.PERF or {}).get('token_cost_quarter_cny'))} 元）；"
+             f"年化只作外推脚注、不作达标判据。"
+             f"档位满 12 周才出（样本不足时印「—」，不拿 27 天噪声判能力）。"
+             f"奖励评估期 2027-10-30 起评判，此前一律 0。**计分时点（2026-11-26 用户拍板）：档位/奖励只在年报（每年 1 月 1 日）判定，月报只报四项口径与季进度、不判档**（`config.PERF.grade_period`）。"
              f"旧四指标（超额/回撤/期望/费用）降级为诊断信息，不再一票否决。")
     L.append("")
     L.append(f"> 基准口径：{_dm['source'] or '未标注'}。**基准是达标线，不是收益预测**；"
              f"无风险利率下行会把达标线一起压低，所以达标 ≠ 绝对金额可观，下表同时给净赚金额。")
     L.append("")
     ok = [r for r in rows if "error" not in r]
-    L.append("| 账本 | 本金 | 净值 | 账户收益(累计) | 年化 | token实花 | 净利润 | 净收益率 | 档位 | 净年化 | 无风险基准 | 最大回撤 | 同期" + BENCH_NAME + " | 超额 | 平仓 | 胜率 | 盈亏比 | 单笔期望 | 费用占比 | 判定 |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    L.append("| 账本 | 本金 | 净值 | 账户收益(累计) | 年化 | token实花 | 净利润 | 净收益率 | 本季净收益 | 档位 | 净年化 | 无风险基准 | 最大回撤 | 同期" + BENCH_NAME + " | 超额 | 平仓 | 胜率 | 盈亏比 | 单笔期望 | 费用占比 | 判定 |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for r in ok:
         _nt = r.get("net") or {}
-        L.append("| {label} | {cap} | {nav} | {tot} | {ann} | {tok} | {npnl} | {nret} | {grade} | {nann} | {dep} | {mdd} | {bench} | {exc} | {closed} | {wr} | {pf} | {exp} | {fee} | **{vd}** |".format(
+        _q = _nt.get("quarter") or {}
+        L.append("| {label} | {cap} | {nav} | {tot} | {ann} | {tok} | {npnl} | {nret} | {qret} | {grade} | {nann} | {dep} | {mdd} | {bench} | {exc} | {closed} | {wr} | {pf} | {exp} | {fee} | **{vd}** |".format(
             label=r["label"], cap=_f(r["capital"], 0), nav=_f(r["nav"]),
             tot=_pct(r["total_return"]), ann=_pct(r["annualized"]),
             tok=_f(_nt.get("token_spent")), npnl=_f(_nt.get("net_pnl")),
-            nret=_pct(_nt.get("net_return")), grade=_nt.get("grade") or "n/a",
+            nret=_pct(_nt.get("net_return")),
+            qret=_pct(_q.get("net_return")) if _q.get("available") else "n/a",
+            grade=(((_nt.get("grade") or "n/a") if _nt.get("multi_sample_ok") else "—") if _show else "—"),
             nann=_pct(_nt.get("net_annualized")),
             dep=_pct(_nt.get("deposit_rate")),
             mdd=_pct(r["max_drawdown"]), bench=_pct(r["bench_return"]), exc=_pct(r["excess"]),
@@ -397,17 +530,45 @@ def to_md(rows, generated):
         for x in r["verdict_reasons"]:
             L.append(f"  - {x}")
         nt = r.get("net") or {}
+        q = nt.get("quarter") or {}
         _yrs = nt.get("years")
         _yrs_txt = f"{_yrs:.2f}" if _yrs is not None else "n/a"
+        # 档位只在样本满 12 周后出（B 类 #22③）：不然 27 天的噪声会直接印成「D 档」，
+        # 读者会把它当成对能力的判决，而样本闸本身已经说明了「还不能判断」。
+        if not _show:
+            _grade_txt = "—（年度评分：每年 1 月 1 日年报定档）"
+        elif not nt.get("multi_sample_ok"):
+            _grade_txt = "—（样本不足，满 12 周才出档）"
+        else:
+            _grade_txt = (nt.get("grade") or "n/a")
         L.append(f"- 验收（2026-11-07口径）：账户收益 **{_f(nt.get('gross_pnl'))} 元**"
                  f"（{_pct(r['total_return'])}）｜token 实花 **{_f(nt.get('token_spent'))} 元**"
                  f"（{nt.get('token_cost_basis') or 'budget.json'}，`--token-cost` 可覆盖）"
                  f"｜净利润 **{_f(nt.get('net_pnl'))} 元**｜净收益率 **{_pct(nt.get('net_return'))}**"
-                 f" → 档位 **{nt.get('grade') or 'n/a'}**")
-        L.append(f"  - 净年化 **{_pct(nt.get('net_annualized'))}** vs 无风险基准 "
+                 f" → 档位 **{_grade_txt}**")
+        # 主指标：本季累计净收益率（季度计价，B 类 #22②）；年化降级为脚注外推值
+        if q.get("available"):
+            _qflag = "✓ 超过季目标" if q.get("bar_ok") else "✗ 低于季目标"
+            L.append(f"- 本季 **{q.get('quarter')}**（{q.get('start')} → {q.get('end')}，"
+                     f"{q.get('days')} 天{'，自建账起' if q.get('inception') else ''}）"
+                     f"累计净收益率 **{_pct(q.get('net_return'))}**"
+                     f"（含账户 {_pct(q.get('gross_return'))} − token "
+                     f"{_f(q.get('token_cost_cny'))} 元）vs 季目标 "
+                     f"{_pct(q.get('target_rate'))}"
+                     f"（{_f(q.get('target_cny'))} 元）→ {_qflag}"
+                     f"（超额 {_f(q.get('excess_cny'))} 元）")
+            _tb = q.get("token_quarter_budget_cny")
+            if _tb:
+                L.append(f"  - 本季 token：实花 {_f(q.get('token_cost_cny'))} 元 / 季度预算 "
+                         f"{_f(_tb)} 元（{_pct(q.get('token_budget_used_pct'))}）")
+        elif q.get("note"):
+            L.append(f"- 本季：{q.get('note')}")
+        L.append(f"  - 净年化 **{_pct(nt.get('net_annualized'))}**（外推值，不作达标判据；动态本金下年报定档用「各月等价年化率的算术平均」，见下）vs 无风险基准 "
                  f"{_pct(nt.get('deposit_rate'))}（{nt.get('deposit_as_of') or '口径未标注'}）"
                  f" → {'✓ 达标' if nt.get('bar_ok') else '✗ 未达标'}")
-        if nt.get("reward_pending"):
+        if not _show:
+            L.append("  - 奖励：—（年度评分后才计提；月报不判档）")
+        elif nt.get("reward_pending"):
             L.append(f"  - 奖励：{nt.get('reward_note') or '未到评估期（2027-10-30 起）'}")
         else:
             L.append("  - 奖励：评估期已到，可按档位计提（见 score.py）")
@@ -460,16 +621,16 @@ def to_md(rows, generated):
     if not ok:
         L.append("账本都还没建好，先跑 `weekly.py --ledger <账本> --init`。")
     elif labels == {"样本不足"}:
-        L.append("样本不足：继续按每周六 20:00 决策跑下去，账本会在下次决策自动结算"
+        L.append("样本不足：继续按每周三、周六 20:30 决策跑下去，账本会在下次决策自动结算"
                  "（卖出按开盘价、买入按限价单触价）；"
-                 "样本满 12 周/10 笔平仓后按「净收益 ≥ token 成本 且 净年化 > 无风险利率基准」判定，"
+                 "样本满 12 周/10 笔平仓后按「净利润 ≥ 0 且 加权年化净收益率 > 无风险利率基准」判定，"
                  "不要因为一两周涨跌改规则。")
     elif "未达标" in labels:
-        L.append("有账本未达标：先看是「token 还没赚回」还是「净年化没跑过无风险基准」——"
+        L.append("有账本未达标：先看是「token 还没赚回」还是「加权年化没跑过无风险基准」——"
                  "前者需要利润或时间，后者要降低换手/提高有效仓位；"
                  "**改任何阈值都必须走一次 git 提交并在 engine-notes.md §六 留纪律**，说明依据是分布/复盘统计，不是某只标的的输赢。")
     else:
-        L.append("两条验收线暂时全过（净收益 ≥ token 成本，净年化 > 无风险利率基准）：这只是起点，"
+        L.append("两条验收线暂时全过（净利润 ≥ 0，加权年化 > 无风险利率基准）：这只是起点，"
                  "继续跑到 6 个月以上，确认不是靠一两次运气；同时看旧四指标是否也转好。"
                  "注意基准已随无风险利率降到 1 年期国债水平，达标门槛随之变低，"
                  "请以上面的「净赚金额 / 本金」判断是否真的值得继续。")
@@ -503,9 +664,13 @@ def main(argv=None):
     ap.add_argument("--deposit-rate", type=float, default=None,
                     help="覆盖无风险利率基准（年化小数，默认取 config.PERF.deposit_rate = 1 年期国债；"
                          "覆盖后报告里的 as_of 会标成「命令行覆盖」，别忘同步 config）")
+    ap.add_argument("--annual", action="store_true",
+                    help="年报模式：出档位/奖励（默认按 config.PERF.grade_period=annual → 月报不出档位，--strict 也不因未达标失败）")
     ap.add_argument("--strict", action="store_true",
                     help="有账本「未达标」时退出码 1（样本不足不算失败；供 decide.py / 定时任务用）")
     args = ap.parse_args(argv)
+    global _ANNUAL
+    _ANNUAL = bool(args.annual)
     global TOKEN_COST_OVERRIDE
     if args.token_cost is not None:
         TOKEN_COST_OVERRIDE = float(args.token_cost)
@@ -523,7 +688,7 @@ def main(argv=None):
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return 0
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    md = to_md(rows, generated)
+    md = to_md(rows, generated, annual=args.annual)
     md_path = os.path.join(OUT, "scorecard.md")
     json_path = os.path.join(OUT, "scorecard.json")
     with open(md_path, "w", encoding="utf-8") as f:
@@ -533,7 +698,7 @@ def main(argv=None):
     print(md)
     print(f"[review] 记分卡：{md_path}")
     print(f"[review] 机器可读：{json_path}")
-    if args.strict and any(str(r.get("verdict") or "").startswith("未达标") for r in rows):
+    if args.strict and _show_grade(args.annual) and any(str(r.get("verdict") or "").startswith("未达标") for r in rows):
         print("[review] ✗ 有账本未达标（--strict → 退出码 1；账本不会被改）")
         return 1
     return 0

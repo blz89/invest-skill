@@ -86,9 +86,25 @@ _OTC_DEFAULTS = {
     "min_scale_yi": 1.0,
     "min_position_value": 100.0,
     "share_class_prefer": "C",
-    "score": {"ret_1y": 40, "dd_1y": 35, "cost_1y": 25},
-    "score_range": {"ret_1y": [0.0, 0.03], "dd_1y": [-0.002, -0.02],
-                    "cost_1y": [0.001, 0.01]},
+    # 打分口径（2026-11-25 B-12：由「后视收益为主」→「前瞻净票息为主」）
+    # 原值：ret_1y 40 / dd_1y 35 / cost_1y 25，score_range.ret_1y=[0, 3%]
+    #   → ret_1y ≥3% 即满分（池内 50/683 只满分），排名实际由「回撤小 + 费低」决定；
+    #     而 ret_1y 最高的 016426（5.61%）反因回撤/费率被压到 84.88 分。
+    # 新值：fwd_net_rate 30 / dd_1y 25 / cost_1y 20 / scale_yi 10 / ret_1y 15
+    #   → 「3Y/5Y 国债均值 − 运作费」当主轴，历史收益只留 15 分、上限放到 5%（不再 3% 饱和）。
+    "score": {"fwd_net_rate": 30, "dd_1y": 25, "cost_1y": 20,
+              "scale_yi": 10, "ret_1y": 15},
+    # 前瞻净票息区间按 2026-11-25 实测 618 只池定：fwd_net_rate ∈ [0.23%, 1.08%]，中位 0.83%。
+    # 下限 0.40%（费吃掉大半票息 → 0 分）、上限 1.10%（3Y/5Y 国债均值 1.283% 扣低费后能拿到的上沿）。
+    # 为什么不用 1.1%–1.7%：那样 99% 的池子都在下限以下，30 分维度事实上恒为 0，等于没改。
+    "score_range": {"fwd_net_rate": [0.004, 0.011],
+                    "dd_1y": [-0.002, -0.02],
+                    "cost_1y": [0.001, 0.01],
+                    "scale_yi": [1.0, 20.0],          # <1 亿已被 L7 淘汰；≥20 亿封顶
+                    "ret_1y": [0.0, 0.05]},
+    # 产品「持有期」上限（天）：名称里带「N 天/月/年（滚动）持有」且 N > 该值 → 不进池。
+    # 2026-11-25 新增（A 类）：此前池里混着 018193「180 天持有期」，买进去 2,300 元锁到 2027-05-01。
+    "max_hold_period_days": 30,
 }
 
 
@@ -109,7 +125,8 @@ CFG_O = _merge_cfg()
 _COLS = ["code", "name", "ftype", "nav_date", "unit_nav", "acc_nav", "purchase_status",
          "min_purchase", "day_limit", "fee", "hist_days", "ret_1y", "ret_3y", "dd_1y",
          "dd_3y", "vol_3y", "mgmt_fee", "redeem_fee_hold", "cost_1y", "score", "level",
-         "level_reason", "key", "share_class"]
+         "level_reason", "key", "share_class", "hold_period_days",
+         "scale_yi", "fwd_net_rate", "fwd_gap_vs_cash"]
 
 # 份额类别后缀：只认单个字母（A/B/C/D/E/F/H/I）。字母前面的字符不能是数字 ——
 # 债基名称里「30天」「7天」「1年」「3个月」这类期限后缀太常见，误当份额会把 A 类吃掉。
@@ -258,6 +275,27 @@ def redeem_fee_at_hold(periods: list[str], fees: list[float],
     return min(v for _, v, _ in pairs)
 
 
+def redeem_ladder(code: str) -> tuple:
+    """实测赎回费阶梯的**原始档位** `(periods, fees)`；取不到 → `([], [])`。
+
+    为什么返回原始档位而不是算好的一个数：otc_book 要按**实际持有天数**估费，而且必须与选池
+    用的是**同一个估计函数**（`redeem_fee_at_hold`）—— 两处各写一套，迟早出现「池里按 0% 算、
+    账本按 1.5% 算」。账本旧实现就是后者（持有 <90 天一律 1.5%），实测 011984 满 7 天即 0。
+    """
+    try:
+        redeem = ds.fetch_fund_fee(code, "赎回费率")
+    except Exception:              # noqa: BLE001 —— 费表取不到让调用方退回保守假设，不能抛
+        return [], []
+    if redeem is None or len(redeem) == 0:
+        return [], []
+    try:
+        periods = [str(x) for x in redeem["period"].tolist()]
+        fees = [m.f(v) for v in redeem["fee_pct"].tolist()]
+    except (KeyError, AttributeError, TypeError):
+        return [], []
+    return periods, fees
+
+
 def fee_parts(code: str) -> dict:
     """运作费 + 赎回费（百分数）。管理费缺失按 0 计；托管/销售服务费同。
 
@@ -298,7 +336,13 @@ def cost_1y(fee_pct, op_pct, redeem_pct) -> float:
 
 
 def score_of(r: dict) -> float:
-    """综合分 0–100：近 1 年收益 40 + 近 1 年回撤 35 + 首年总成本（反向）25。"""
+    """综合分 0–100（2026-11-25 B-12：前瞻优先）。
+
+    权重 = 前瞻净票息 30 / 1 年回撤 25 / 全成本 20 / 规模 10 / 1 年收益 15。
+    为什么把历史收益压到 15 分：R2 池 3 年净值全在债牛里，ret_1y 只能证明「稳不稳」，
+    真正决定未来一年拿多少的是「到期收益率 − 运作费」。
+    缺字段（例如旧产物没有 fwd_net_rate 列）→ 该项记 0 分，不抛异常（打分不能阻塞筛选）。
+    """
     w = CFG_O.get("score") or {}
     rg = CFG_O.get("score_range") or {}
 
@@ -306,14 +350,17 @@ def score_of(r: dict) -> float:
         v = rg.get(key) or dflt
         return float(v[0]), float(v[1])
 
-    lo, hi = rng("ret_1y", [0.0, 0.03])
-    s = m.score_linear(r.get("ret_1y"), lo, hi, float(w.get("ret_1y", 40)))
+    lo, hi = rng("fwd_net_rate", [0.011, 0.017])
+    s = m.score_linear(r.get("fwd_net_rate"), lo, hi, float(w.get("fwd_net_rate", 30)))
     good, bad = rng("dd_1y", [-0.002, -0.02])
-    s += m.score_inverse(r.get("dd_1y"), good, bad, float(w.get("dd_1y", 35)))
+    s += m.score_inverse(r.get("dd_1y"), good, bad, float(w.get("dd_1y", 25)))
     clo, chi = rng("cost_1y", [0.001, 0.01])
-    s += m.score_inverse(r.get("cost_1y"), clo, chi, float(w.get("cost_1y", 25)))
+    s += m.score_inverse(r.get("cost_1y"), clo, chi, float(w.get("cost_1y", 20)))
+    slo, shi = rng("scale_yi", [1.0, 20.0])
+    s += m.score_linear(r.get("scale_yi"), slo, shi, float(w.get("scale_yi", 10)))
+    rlo, rhi = rng("ret_1y", [0.0, 0.05])
+    s += m.score_linear(r.get("ret_1y"), rlo, rhi, float(w.get("ret_1y", 15)))
     return round(float(s), 2)
-
 
 def next_level(level: str) -> str:
     """按 config.RISK["levels"] 的登记顺序取下一档（R2 → R3）。等级降级不在这里写死字符串。"""
@@ -578,17 +625,42 @@ def run_screen(limit: int | None = None, verbose: bool = True,
                     continue
                 fees[code] = parts
 
+    # 前瞻票息（2026-11-25 B-12）：整池共用一条国债曲线，循环外算一次。
+    # 净票息 = 曲线均值(3Y/5Y) − 该只运作费（管理/托管/销售服务费，fee_parts 已汇总成 op_fee）。
+    _fwd, _fwd_asof = m.fwd_bond_yield()
+    try:
+        _cash = float((config.cash_rates() or {}).get("money_fund") or 0.0)
+    except Exception:              # noqa: BLE001 —— 现金层利率读不到只影响「与货基差额」展示
+        _cash = 0.0
+    n_fwd_na = 0
+
     daily = nav_daily_map()
     rows: list[dict] = []
     dropped_fee = 0
+    dropped_hold = 0
+    _max_hold = int(CFG_O.get("max_hold_period_days") or 0)
     for r in pool7:
+        # 持有期硬过滤（2026-11-25，A 类）：合同锁定期 > 上限的产品不进池。
+        # 放在最前：这类产品连费率/净值都不用取，省一次网络调用。
+        _hold = m.hold_period_days(r.get("name"))
+        if _max_hold > 0 and _hold and _hold > _max_hold:
+            dropped_hold += 1
+            _mark("持有期过长")
+            continue
         f = fees.get(r["code"])
         if f is None:                     # 费率取不到 → 成本算不准 → 不进池（fail-closed）
             dropped_fee += 1
             _mark("费率取数失败")
             continue
         c1 = cost_1y(r.get("fee_pct"), f.get("op_fee"), f.get("redeem_fee_hold"))
-        tmp = {**r, "cost_1y": c1}
+        # 前瞻净票息（B-12）：op_fee 是**百分数**（0.45 = 0.45%），先除 100。
+        _op_pct = m.f(f.get("op_fee"), 0.0) or 0.0
+        _fwd_net = round(_fwd - _op_pct / 100.0, 6) if _fwd else None
+        if _fwd_net is None:
+            n_fwd_na += 1
+        tmp = {**r, "cost_1y": c1, "fwd_net_rate": _fwd_net,
+               "fwd_gap_vs_cash": (round(_fwd_net - _cash, 6)
+                                   if (_fwd_net is not None and _cash) else None)}
         tmp["score"] = score_of(tmp)
         lv = level_of(r["ftype"], r["name"], r)
         dm = daily.get(r["code"]) or {}
@@ -608,11 +680,21 @@ def run_screen(limit: int | None = None, verbose: bool = True,
             "cost_1y": c1, "score": tmp["score"],
             "level": lv["level"], "level_reason": lv["reason"],
             "key": r["share_key"], "share_class": r["share_class"],
+            "hold_period_days": _hold,
+            "scale_yi": m.f(r.get("scale_yi")),
+            "fwd_net_rate": _fwd_net,
+            "fwd_gap_vs_cash": tmp["fwd_gap_vs_cash"],
         })
     _mark_n = fail.get("费率取数失败", 0)
     funnel["L8_fee_failed"] = int(_mark_n)     # 与 L7 之后并列，不算独立层
+    funnel["L8_hold_too_long"] = int(dropped_hold)
     funnel["final"] = len(rows)
-    _stage("final", len(rows), dropped_fee + fee_err, "费率取数失败（fail-closed）")
+    funnel["fwd_yield_proxy"] = _fwd
+    funnel["fwd_asof"] = _fwd_asof
+    funnel["cash_rate_money_fund"] = _cash
+    funnel["fwd_unavailable"] = n_fwd_na
+    _stage("final", len(rows), dropped_fee + fee_err,
+           f"费率取数失败（fail-closed）；另剔除持有期 >{_max_hold} 天的 {dropped_hold} 只")
 
     rows.sort(key=lambda x: (-(x["score"] or 0.0), x["code"]))   # 同分按代码，保证确定性
     funnel["fail_reasons"] = {k: int(fail[k]) for k in sorted(fail)}

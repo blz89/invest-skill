@@ -3,8 +3,8 @@ r"""联网冒烟：把取数接口层的 40 个接口挨个调一遍，打印 sh
 
 用法::
 
-    $env:PYTHONPATH='<本技能目录>\stock'; $env:PYTHONIOENCODING='utf-8'
-    & <本技能目录>\stock\.venv\Scripts\python.exe <本技能目录>\stock\tools\smoke.py
+    $env:PYTHONPATH='D:\skills\invest\stock'; $env:PYTHONIOENCODING='utf-8'
+    & D:\skills\invest\stock\.venv\Scripts\python.exe D:\skills\invest\stock\tools\smoke.py
     ... -f stock_zh_a_daily         # 只跑一个
     ... -q                          # 只打印失败项
 

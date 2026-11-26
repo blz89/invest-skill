@@ -9,20 +9,20 @@
     3. `lastBalance` —— 当前账户余额，用于 run 前后快照复核。
     4. 都拿不到时**不估算、不记账**：记账只认实扣，缺数据就 fail loud。
 
-计费口径（周期结算）：本次花费 = 插件扣费记录 events[] 在「上次结算终点 → 现在」区间的累计
-（金额 / token / 调用次数）；结算完把终点推进到现在（out/team/billing_cycle.json），绝不重复计数。
-结算发生在**下一次决策会话的第 2 步**（本次会话还没结束、数不准）：一次结算覆盖上一次决策会话 +
-期间巡检（巡检按 0.01 元/天定额记）；子代理会话落在同一份用量记录里，天然包含在内。
-账户余额观测（accounting.debitUnits）只作参考字段，不参与记账。
-
-可选：想单独量某一次任务窗口时，仍可 --task-begin 记快照、--task-end 结算该窗口（basis=snapshot）；
-默认不需要开窗。
+计费口径（**每次记账都认实扣**）：
+1. `$DSH_HOME/.dshw-usage.json` 里的 `events[]` 是**精确到单次请求**的真实扣费（{ts, day, cost, tokens}）；
+2. 每日巡检会话：开头 `--task-begin`、收口 `--task-end`，按「开窗 → 收口」这段**对话时间窗**去 events 逐条求和记账
+   （basis=events-window，estimated=False）；同时用开窗/收口累计快照的差额做第二套对账，不一致告警、以时间窗为准；
+3. 决策会话第 2 步 `--cycle-end` 用于**补记上一周期**（上次结算终点 → 现在；若撞上未收口的
+   巡检窗口，先结算窗口、再补窗口前的空档，不漏记也不重复），并用 `accounting` 账本的当日实扣做上界校验；
+4. 缺数据时**不估算、不记账**（fail loud）；`--flat-yuan` 只留作历史/离线对账。
 
 用法：
-    python billing.py --task-end --ledger 50k          # 决策第 2 步：补记上一周期
-    python billing.py --flat-yuan 0.01 --ledger 50k    # 巡检：0.01 元/天定额
+    python billing.py --task-begin --ledger 50k --note 每日巡检   # 巡检第 1 步：开窗
+    python billing.py --task-end --ledger 50k --note 每日巡检     # 巡检收口：按实扣结算本会话
+    python billing.py --cycle-end --ledger 50k                   # 决策第 2 步：补记上一周期
     python billing.py --status --ledger 50k
-    python billing.py --settle --day 2026-11-21       # 只读对账
+    python billing.py --settle --day 2026-11-21                  # 只读对账
 """
 from __future__ import annotations
 
@@ -64,14 +64,22 @@ def usage_path() -> str | None:
 
 
 def load_usage(path: str | None = None) -> dict:
+    """读插件用量文件。找不到 → {}；找到但读/解析失败 → {"_error": 原因}。
+
+    为什么区分：容量口径下「文件缺失」= 插件没启用（可降级），而「文件损坏/被轮转」
+    必须 fail-loud（A2：窗口结算不能把读不到当成 0 元）。调用方用 `d.get("_error")` 判断。
+    """
     p = path or usage_path()
     if not p:
         return {}
     try:
         with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"_error": f"用量文件格式异常（非对象）：{p}"}
+        return data
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"_error": f"用量文件读取/解析失败（{p}）：{exc}"}
 
 
 def events(data: dict | None = None) -> list[dict]:
@@ -104,6 +112,22 @@ def snapshot_delta(before: dict | None, after: dict | None) -> dict:
         "cost_cny": round(float(after.get("cost_cny") or 0.0)
                           - float(before.get("cost_cny") or 0.0), 6),
     }
+
+
+def window_events(since_ms: int, until_ms: int | None = None,
+                  data: dict | None = None) -> dict:
+    """按「对话时间窗」直接查插件 events（用户 2026-11-25 定：用对话起止时间去插件找）。
+
+    since_ms < ts <= until_ms 的逐轮事件求和。这是任务收口的**记账口径**；
+    同时用开窗/收口累计快照做差额对账（两套方案，不一致就告警、以时间窗为准）。
+    """
+    d = data if data is not None else load_usage()
+    now = int(until_ms if until_ms is not None else _dt.datetime.now().timestamp() * 1000)
+    rows = [e for e in events(d) if int(since_ms) < int(e.get("ts") or 0) <= now]
+    return {"since_ms": int(since_ms), "until_ms": now,
+            "n_calls": len(rows),
+            "tokens": int(sum(int(e.get("tokens") or 0) for e in rows)),
+            "cost_cny": round(sum(float(e.get("cost") or 0.0) for e in rows), 6)}
 
 
 def balance(data: dict | None = None) -> float | None:
@@ -219,14 +243,14 @@ def _cycle_read() -> dict:
     try:
         with open(CYCLE_FILE, "r", encoding="utf-8") as f:
             return json.load(f) or {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        if os.path.exists(CYCLE_FILE):
+            print(f"[计费] 告警：结算终点文件不可读（{exc}），按无终点处理（从今天 0 点起算）")
         return {}
 
 
 def _cycle_write(doc: dict) -> None:
-    os.makedirs(os.path.dirname(CYCLE_FILE), exist_ok=True)
-    with open(CYCLE_FILE, "w", encoding="utf-8") as f:
-        json.dump(doc, f, ensure_ascii=False, indent=2, sort_keys=True)
+    _atomic_json(CYCLE_FILE, doc)
 
 
 def cycle_span(now_ms: int | None = None) -> tuple[int, int]:
@@ -277,10 +301,26 @@ def task_open() -> bool:
     return _task_read() is not None
 
 
+def _atomic_json(path: str, doc: dict) -> None:
+    """原子写 JSON（tmp + os.replace）：中途被杀不会留下半截文件。"""
+    import tempfile
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 def _task_write(doc: dict) -> None:
-    os.makedirs(os.path.dirname(TASK_OPEN), exist_ok=True)
-    with open(TASK_OPEN, "w", encoding="utf-8") as f:
-        json.dump(doc, f, ensure_ascii=False, indent=2, sort_keys=True)
+    _atomic_json(TASK_OPEN, doc)
 
 
 def task_begin(ledgers: list | None = None, since_ms: int | None = None,
@@ -296,6 +336,13 @@ def task_begin(ledgers: list | None = None, since_ms: int | None = None,
         # 上次任务忘了 --task-end：先把它结算掉，别让旧窗口把本次的时间一起吃掉
         leftover = task_settle(note="上一个任务窗口未收口，自动结算", close=True)
         _w = leftover.get("window") or {}
+        if not leftover.get("ok"):
+            # A1：旧窗口结算失败时绝不能覆盖——覆盖会永久丢掉旧窗口里的花费
+            print(f"[任务窗口] 上一轮未关窗（自 {_w.get('since', '?')} 起）且自动结算失败："
+                  f"{leftover.get('reason') or '未知原因'}；本次不开窗、不覆盖旧窗口。"
+                  "请先修复（重跑 --task-end，或确认用量记录正常后手删 "
+                  "out/team/task_open.json）再开窗。")
+            raise SystemExit(2)
         print(f"[任务窗口] 上一轮未关窗（自 {_w.get('since', '?')} 起），"
               f"已自动结算 {float(leftover.get('cost_cny') or 0.0):.4f} 元")
     start_ms = int(since_ms if since_ms is not None else now)
@@ -313,7 +360,8 @@ def task_settle(note: str = "", close: bool = False) -> dict:
     """结算 [since_ms, now] 这段窗口，并把 since_ms 推到 now（分段结算、不重复）。
 
     close=True → 删掉 task_open.json（任务结束）。
-    无窗口文件时走周期结算（上次终点 → 现在，ok=True）；窗口文件存在时按快照差额结算该窗口；失败才返回 ok=False，调用方不得自己编数字。
+    无窗口文件时走周期结算（上次终点 → 现在，ok=True；区间内本机全部 events 都计入，含开发/对话，技能暂停时应先 billing.cycle_advance() 推进终点避免误记）；窗口文件存在时按「开窗 → 收口」的
+    events 时间窗求和结算（并用开窗快照差额对账，basis=events-window）；失败才返回 ok=False，调用方不得自己编数字。
     """
     doc = _task_read()
     now = int(_dt.datetime.now().timestamp() * 1000)
@@ -326,11 +374,28 @@ def task_settle(note: str = "", close: bool = False) -> dict:
     if doc is None:
         # 周期结算：上次结算终点 → 现在，直接查插件 events 记录（用户口径，不用开窗）
         cc = cycle_cost(now)
+        # 第二套校验：插件 accounting 账本的「当日实扣」（账户口径，含本机所有会话），
+        # 只作上界参考——本次任务实扣不可能超过它；超了说明 events 记录异常，要告警。
+        ub = 0.0
+        try:
+            d0 = _dt.date.fromisoformat(ts_to_str(cc["since_ms"])[:10])
+            d1 = _dt.date.fromisoformat(ts_to_str(cc["until_ms"])[:10])
+            day = d0
+            while day <= d1:
+                ub += float(day_debit_cny(day.strftime("%Y-%m-%d"), d) or 0.0)
+                day += _dt.timedelta(days=1)
+        except (ValueError, TypeError):
+            ub = 0.0
+        ub_exceeded = bool(ub > 0 and float(cc["cost_cny"]) > ub + 0.05)
+        if ub_exceeded:
+            print(f"[计费] 告警：events 时间窗 {float(cc['cost_cny']):.4f} 元超过账户实扣上界 "
+                  f"{ub:.4f} 元，请核对插件扣费记录")
         win = {"since": cc["since"], "until": cc["until"],
                "n_calls": cc["n_calls"], "tokens": cc["tokens"],
                "cost_cny": cc["cost_cny"], "basis": "events-cycle",
                "snapshot": {}, "events_cost_cny": cc["cost_cny"],
-               "account_delta": account_delta(account_snapshot(), account_snapshot(data=d))}
+               "account_ub_cny": round(ub, 6), "account_ub_exceeded": ub_exceeded,
+               "account_delta": {}}  # 周期分支没有开窗快照，不做假差额；上界校验见 account_ub_cny
         lgs = sorted(list(config.PAPER["ledgers"].keys()))
         each = round(float(win["cost_cny"]) / len(lgs), 6) if lgs else 0.0
         by_ledger = {}
@@ -355,21 +420,56 @@ def task_settle(note: str = "", close: bool = False) -> dict:
         return {"ok": False, "cost_cny": 0.0, "source": "task-window",
                 "reason": "窗口缺少开启快照（旧版 task_open.json）：不估算、不记账；"
                           "请重新执行 billing.py --task-begin"}
+    if d.get("_error"):
+        # A2：用量文件损坏/被轮转时不能「按 0 元结算 + 推进终点 + 删窗口」
+        return {"ok": False, "cost_cny": 0.0, "source": "task-window",
+                "reason": f"插件用量记录不可读（{d['_error']}）：不结算、不推进结算终点、不删窗口；"
+                          "请先确认 DSH 用量插件正常后重跑 --task-end"}
+    _n0 = int(snap0.get("n_calls") or 0)
+    _all_ev = events(d)
+    if _n0 > 0 and len(_all_ev) < _n0:
+        # A2 补充：文件还在但条数比开窗时少 = 被轮转/截断，差额不可信
+        return {"ok": False, "cost_cny": 0.0, "source": "task-window",
+                "reason": (f"用量记录条数比开窗时少（开窗 {_n0} 条、现在 {len(_all_ev)} 条，"
+                           "疑似被轮转/截断）：不结算、不推进终点、不删窗口；请人工核对后重跑")}
+    _span_h = max(0.0, (now - int(doc.get("since_ms") or now)) / 3600000.0)
+    stale_window = _span_h > 6.0
+    if stale_window:
+        # A3：窗口跨夜/跨日时整段消耗都会记给本任务，先告警
+        print(f"[计费] 告警：任务窗口已开 {_span_h:.1f} 小时（>6h），"
+              "整段消耗将全部记给本任务；请确认窗口是巡检/决策正常开启，否则人工核对")
     delta = snapshot_delta(snap0, usage_snapshot(data=d))
-    ev_cost = round(max(0.0, float(delta.get("cost_cny") or 0.0)), 6) if delta else 0.0
+    snap_cost = round(max(0.0, float(delta.get("cost_cny") or 0.0)), 6) if delta else 0.0
+    ev_win = window_events(int(doc["since_ms"]), now, d)
+    cost = round(max(0.0, float(ev_win["cost_cny"])), 6)
+    basis = "events-window"
+    diff = round(cost - snap_cost, 6)
+    cross_ok = abs(diff) <= 0.011
+    if cost <= 0 and snap_cost > 0:
+        print(f"[计费] 窗口内查不到 events（时间戳异常/插件未落盘），回落快照差额 {snap_cost:.4f} 元")
+        cost = snap_cost
+        basis = "snapshot-fallback"
+        diff = 0.0
+        cross_ok = True
+    elif not cross_ok:
+        print(f"[计费] 交叉校验不一致：events 时间窗 {cost:.4f} 元 vs 快照差额 "
+              f"{snap_cost:.4f} 元（差 {diff:+.4f}），以 events 时间窗为准")
     acc0 = doc.get("account") or {}
     acc1 = account_snapshot(data=d)
     ad = account_delta(acc0, acc1)
-    # 记账口径：逐轮事件快照差额（每次调用都落一条 event；结算在下一次决策第 2 步，本次会话结束后才准）。
-    # 账户余额观测差额只作为参考字段写进流水（观测是抽样的，结算瞬间可能还没反映最后一轮）。
-    cost = ev_cost
-    basis = "snapshot"
+    # 记账口径（2026-11-25 用户定）：按「开窗 → 收口」这段对话的时间去插件 events 里逐条求和；
+    # 开窗快照与收口快照的差额做第二套对账（漏最后一条事件时两边会不一致，告警并以时间窗为准）；
+    # 账户观测差额只作参考字段（抽样观测，结算瞬间可能还没反映最后一轮）。
     win = {"since": ts_to_str(int(doc["since_ms"])), "until": ts_to_str(now),
-           "n_calls": int(delta["n_calls"]) if delta else 0,
-           "tokens": int(delta["tokens"]) if delta else 0,
+           "n_calls": int(ev_win["n_calls"]),
+           "tokens": int(ev_win["tokens"]),
            "cost_cny": cost, "basis": basis,
            "snapshot": delta or {},
-           "events_cost_cny": ev_cost,
+           "events_cost_cny": cost,
+           "snapshot_cost_cny": snap_cost,
+           "cross_check": {"ok": cross_ok, "diff_cny": diff,
+                           "method": "events 时间窗 vs 收口快照差额"},
+           "stale_window": stale_window, "window_hours": round(_span_h, 2),
            "account_delta": ad or {}}
     lgs = doc.get("ledgers") or sorted(config.PAPER["ledgers"].keys())
     each = round(float(win["cost_cny"]) / len(lgs), 6) if lgs else 0.0
@@ -383,10 +483,15 @@ def task_settle(note: str = "", close: bool = False) -> dict:
                    {"since": win["since"], "until": win["until"], "cost_cny": amt,
                     "tokens": win["tokens"], "n_calls": win["n_calls"],
                     "basis": win["basis"],
-                    "events_cost_cny": round(ev_cost / len(lgs), 6) if lgs else 0.0,
+                    "events_cost_cny": round(cost / len(lgs), 6) if lgs else 0.0,
+                    "snapshot_cost_cny": round(snap_cost / len(lgs), 6) if lgs else 0.0,
+                    "cross_check": win["cross_check"],
                     "source": "task-window", "estimated": False},
                    note=(f"{note or '任务窗口结算'}：窗口 {win['since']} → {win['until']}，"
-                         f"{win['n_calls']} 次调用，口径 {win['basis']}，{len(lgs)} 本均分"))
+                         f"{win['n_calls']} 次调用，口径 {win['basis']}"
+                         f"（快照差额 {snap_cost:.4f} 元"
+                         f"{'，对账一致' if cross_ok else '，对账不一致已告警'}），"
+                         f"{len(lgs)} 本均分"))
     doc["steps"] = (doc.get("steps") or []) + [
         {"at": ts_to_str(now), "since": win["since"], "until": win["until"],
          "cost_cny": round(float(win["cost_cny"]), 6), "n_calls": win["n_calls"]}]
@@ -395,8 +500,15 @@ def task_settle(note: str = "", close: bool = False) -> dict:
     if close:
         try:
             os.remove(TASK_OPEN)
-        except OSError:
-            pass
+        except OSError as exc:
+            # 删不掉（Windows 文件占用）时把窗口起点推进并落盘：下次结算从新起点算，不会重复计费
+            try:
+                _task_write(doc)
+                print(f"[计费] 告警：无法删除 {TASK_OPEN}（{exc}），"
+                      f"已将窗口起点推进到 {doc['since']}，下次结算不会重复计费")
+            except OSError:
+                print(f"[计费] 告警：无法删除/改写 {TASK_OPEN}（{exc}）；"
+                      "若下次仍出现窗口结算，请手删该文件，否则可能重复计费")
     else:
         _task_write(doc)
     return {"ok": True, "window": win, "cost_cny": round(float(win["cost_cny"]), 6),
@@ -404,13 +516,63 @@ def task_settle(note: str = "", close: bool = False) -> dict:
             "source": "task-window", "estimated": False}
 
 
+def task_settle_cycle(note: str = "") -> dict:
+    """决策第 2 步：补记「上次周期终点 → 现在」（A4）。
+
+    若存在未收口的巡检窗口：先补记「上次周期终点 → 窗口起点」的空档（events-cycle），
+    再结算该窗口（把终点推进到 now）。这样决策第 2 步不会因为撞上巡检窗口而静默跳过
+    周期缺口，也不会把巡检窗口重复记一次。
+    """
+    doc = _task_read()
+    now = int(_dt.datetime.now().timestamp() * 1000)
+    d = load_usage()
+    if d.get("_error"):
+        return {"ok": False, "cost_cny": 0.0, "source": "events-cycle",
+                "reason": f"插件用量记录不可读（{d['_error']}）：不结算、不推进终点"}
+    parts = []
+    gap_cost = 0.0
+    if doc is not None:
+        prev, _ = cycle_span(now)
+        win_since = int(doc.get("since_ms") or 0)
+        if 0 < prev < win_since:
+            gap = window_events(prev, win_since, d)
+            gap_cost = round(max(0.0, float(gap["cost_cny"])), 6)
+            lgs = sorted(list(config.PAPER["ledgers"].keys()))
+            each = round(gap_cost / len(lgs), 6) if lgs else 0.0
+            for i, lg in enumerate(lgs):
+                amt = each if i < len(lgs) - 1 else round(gap_cost - each * (len(lgs) - 1), 6)
+                if abs(amt) < 1e-9:
+                    continue
+                record_run(new_run_id(lg), lg,
+                           {"since": ts_to_str(prev), "until": ts_to_str(win_since),
+                            "cost_cny": amt, "tokens": int(gap["tokens"]),
+                            "n_calls": int(gap["n_calls"]), "basis": "events-cycle",
+                            "source": "events-cycle", "estimated": False},
+                           note=(f"{note or '补记上一周期'}：窗口前空档 {ts_to_str(prev)} → "
+                                 f"{ts_to_str(win_since)}，{gap['n_calls']} 次调用"))
+            parts.append({"kind": "gap", "since": ts_to_str(prev),
+                          "until": ts_to_str(win_since), "cost_cny": gap_cost,
+                          "n_calls": int(gap["n_calls"])})
+        w = task_settle(note=(note or "补记上一周期：先结算未收口巡检窗口"), close=True)
+        if not w.get("ok"):
+            return {"ok": False, "cost_cny": round(gap_cost, 6), "parts": parts,
+                    "reason": "未收口窗口结算失败：" + str(w.get("reason"))}
+        return {"ok": True, "window": w.get("window"), "gap_cost_cny": round(gap_cost, 6),
+                "cost_cny": round(gap_cost + float(w.get("cost_cny") or 0.0), 6),
+                "by_ledger": w.get("by_ledger") or {}, "parts": parts,
+                "source": "events-cycle+task-window", "estimated": False, "closed": True}
+    r = task_settle(note=(note or "补记上一周期"), close=True)
+    r["parts"] = [{"kind": "cycle", "ok": r.get("ok"), "cost_cny": r.get("cost_cny")}]
+    return r
+
+
 def day_settled(day: str) -> float:
-    """当天已进账本的金额（只认任务窗口口径）。用于和对账单做差额展示。"""
+    """当天已进账本的金额（任务窗口实结 + 周期补记）。用于和对账单做差额展示。"""
     doc = load_budget()
     total = 0.0
     for _lg, b in (doc.get("ledgers") or {}).items():
         for r in (b.get("runs") or []):
-            if str(r.get("source")) not in ("task-window", "balance-accounting"):
+            if str(r.get("source")) not in ("task-window", "events-cycle", "balance-accounting"):
                 continue
             if str(r.get("recorded_at") or "")[:10] == day:
                 total += float(r.get("cost_cny") or 0.0)
@@ -508,10 +670,7 @@ def load_budget() -> dict:
 
 
 def save_budget(doc: dict) -> str:
-    os.makedirs(os.path.dirname(BUDGET_JSON), exist_ok=True)
-    with open(BUDGET_JSON, "w", encoding="utf-8") as f:
-        json.dump(doc, f, ensure_ascii=False, indent=2, sort_keys=True)
-        f.write("\n")
+    _atomic_json(BUDGET_JSON, doc)
     return BUDGET_JSON
 
 
@@ -538,6 +697,11 @@ def record_run(run_id: str, ledger: str, win: dict, capital: float | None = None
     cap = float(capital if capital is not None else _ledger_capital(ledger))
     b = doc["ledgers"].get(ledger) or _empty_budget(cap, ledger)
     b["capital"] = cap
+    # A9：同一 run_id 重复记账 = 重复计费，必须幂等。
+    for _r0 in (b.get("runs") or []):
+        if str(_r0.get("run_id")) == str(run_id):
+            return {"ok": True, "dup": True, "run_id": run_id, "ledger": ledger,
+                    "reason": "同一 run_id 已记账，跳过（防重复计费）", "budget": b}
 
     row = {
         "run_id": run_id,
@@ -594,8 +758,8 @@ def add_bonus(ledger: str, bonus_cny: float, note: str = "") -> dict:
 def record_flat(ledger: str, amount_cny: float, note: str = "") -> dict:
     """按定额直接记一笔费用（不走 token 用量账本）。
 
-    用于按次定额的运维类任务（如 20:00 工作日巡检简报），由 Lead 在任务收口时调用；
-    与 record_run 写同一份 billing.jsonl / budget.json，保持净利润口径完整。
+    历史/离线对账用：巡检与决策已改为「开窗 → 收口按 events 实扣」（task_begin/task_end），
+    本函数只保留给补账、离线对账与旧数据兼容；与 record_run 写同一份 billing.jsonl / budget.json。
     """
     doc = load_budget()
     cap = _ledger_capital(ledger)
@@ -705,14 +869,14 @@ def main():
                     help="账本（决定预算档位），默认 50k")
     ap.add_argument("--flat-yuan", type=float, default=None, dest="flat_yuan",
                     help="按定额（元）直接记一笔费用（不走 token 用量），配合 --note 使用")
-    ap.add_argument("--note", default="", help="[--flat-yuan] 备注")
+    ap.add_argument("--note", default="", help="备注（--flat-yuan / --task-begin / --task-end 共用）")
     ap.add_argument("--snapshot", action="store_true", help="打印 run 前余额快照")
     ap.add_argument("--status", action="store_true", help="打印预算状态")
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     ap.add_argument("--task-begin", action="store_true",
-                    help="可选：登记任务窗口起点（默认走周期结算，不需要开窗）")
+                    help="登记任务窗口起点（每日巡检第 1 步；不登记就按周期结算）")
     ap.add_argument("--task-end", action="store_true",
-                    help="【决策第 2 步】补记上一周期：上次结算终点 → 现在（查插件扣费记录）")
+                    help="结算本会话实际扣费（每日巡检收口）；决策第 2 步补记上一周期请用 --cycle-end")
     ap.add_argument("--settle", action="store_true",
                     help="只读对账：今日全账户实扣 vs 本技能已入账（不记账）")
     ap.add_argument("--day", default=None, help="对账日 YYYY-MM-DD，默认今天")
@@ -720,6 +884,8 @@ def main():
                     help="剔除历史「按天均分」流水（source=balance-accounting），重算预算")
     ap.add_argument("--purge-test", action="store_true",
                     help="清掉 selftest/手工测试写进真实账本的假记录")
+    ap.add_argument("--cycle-end", action="store_true",
+                    help="补记上一周期：若存在未收口的巡检窗口，先结算窗口再补周期缺口（决策第 2 步用）")
     a = ap.parse_args()
 
     if a.flat_yuan is not None:
@@ -747,7 +913,8 @@ def main():
         return 0
 
     if a.task_begin:
-        doc = task_begin(note="billing.py --task-begin")
+        doc = task_begin(ledgers=[a.ledger] if a.ledger else None,
+                         note=(a.note or "billing.py --task-begin"))
         if a.json:
             print(json.dumps(doc, ensure_ascii=False, indent=2))
         else:
@@ -755,7 +922,7 @@ def main():
             _snap = doc.get("snapshot") or {}
             print(f"  逐轮事件快照：{_snap.get('n_calls', 0)} 次调用 / "
                   f"{_snap.get('tokens', 0)} tok / "
-                  f"{float(_snap.get('cost_cny') or 0.0):.4f} 元（记账口径：收尾相减）")
+                  f"{float(_snap.get('cost_cny') or 0.0):.4f} 元（记账口径：收口时按对话时间窗查 events 求和，快照差额对账）")
             _acc = doc.get("account") or {}
             if _acc:
                 print(f"  账户实扣快照（仅参考）：累计 {float(_acc.get('cny') or 0.0):.4f} 元"
@@ -764,8 +931,24 @@ def main():
             print(f"  {TASK_OPEN}")
         return 0
 
+    if a.cycle_end:
+        r = task_settle_cycle(note=(a.note or "billing.py --cycle-end"))
+        if a.json:
+            print(json.dumps(r, ensure_ascii=False, indent=2))
+        else:
+            if not r.get("ok"):
+                print("未结算：" + str(r.get("reason")))
+                return 1
+            for part in (r.get("parts") or []):
+                print(f"  [{part.get('kind')}] {part.get('since', '—')} → "
+                      f"{part.get('until', '—')}｜{float(part.get('cost_cny') or 0.0):.4f} 元")
+            print(f"周期补记：共 {float(r.get('cost_cny') or 0.0):.4f} 元")
+            for lg, amt in (r.get("by_ledger") or {}).items():
+                print(f"  {lg} 记 {amt:.4f} 元")
+        return 0
+
     if a.task_end:
-        r = task_settle(note="billing.py --task-end", close=True)
+        r = task_settle(note=(a.note or "billing.py --task-end"), close=True)
         if a.json:
             print(json.dumps(r, ensure_ascii=False, indent=2))
         else:
@@ -775,11 +958,20 @@ def main():
             w = r["window"]
             print(f"任务窗口结算：{w['since']} → {w['until']}｜{w['n_calls']} 次调用"
                   f"｜共 {r['cost_cny']:.4f} 元｜口径 {w.get('basis')}")
+            if w.get("stale_window"):
+                print(f"  告警：窗口跨 {w.get('window_hours')} 小时（>6h），整段消耗记给本任务")
+            _cc = w.get("cross_check") or {}
+            if _cc:
+                print(f"  快照差额对账：{float(w.get('snapshot_cost_cny') or 0.0):.4f} 元"
+                      f"（{_cc.get('method')}，{'一致' if _cc.get('ok') else '不一致'}，"
+                      f"差 {float(_cc.get('diff_cny') or 0.0):+.4f} 元）")
+            _ub = w.get("account_ub_cny")
+            if _ub:
+                print(f"  账户实扣上界校验：{float(_ub):.4f} 元（插件 accounting 当日实扣，含本机其他会话）")
             _ad = w.get("account_delta") or {}
             if _ad:
                 print(f"  账户口径差额：{float(_ad.get('cny') or 0.0):+.4f} 元"
-                      f"（{_ad.get('units')} units）")
-            print(f"  逐轮事件分项：{float(w.get('events_cost_cny') or 0.0):.4f} 元")
+                      f"（{_ad.get('units')} units，仅参考）")
             for lg, amt in r["by_ledger"].items():
                 print(f"  {lg} 记 {amt:.4f} 元")
         return 0

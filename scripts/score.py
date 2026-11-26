@@ -108,7 +108,8 @@ def _veto_check(grade: str, mdd: float | None) -> tuple[bool, str]:
 
 def evaluate(total_return: float, token_cost_cny: float, capital: float,
              mdd: float | None = None, as_of=None, days: float | None = None,
-             net_profit: float | None = None) -> dict:
+             net_profit: float | None = None,
+             annual_rate_override: float | None = None) -> dict:
     """一次完整评估：返回评分、奖励、留存、下一步预算等全部中间量。
 
     ``token_cost_cny`` 是 **token 实花**（budget.json 累计 spent），不是年度计提。
@@ -135,7 +136,11 @@ def evaluate(total_return: float, token_cost_cny: float, capital: float,
     # 年报结算：不足一年也按等价年化净收益率定档；奖励仍按当年净利润（不是年化理论值）。
     net_rate_ann = None
     grade_basis = nr
-    if days and float(days) >= 1.0 and (1.0 + nr) > 0.0:
+    if annual_rate_override is not None and float(annual_rate_override) > -1.0:
+        # 动态本金（2026-11-26）：年报定档 = 各月等价年化率的算术平均，整段/加权年化只作参考
+        net_rate_ann = float(annual_rate_override)
+        grade_basis = net_rate_ann
+    elif days and float(days) >= 1.0 and (1.0 + nr) > 0.0:
         net_rate_ann = (1.0 + nr) ** (365.0 / float(days)) - 1.0
         grade_basis = net_rate_ann
     grade = grade_of(grade_basis)
@@ -171,6 +176,8 @@ def evaluate(total_return: float, token_cost_cny: float, capital: float,
         "net_rate_ann": net_rate_ann,
         "grade_basis": grade_basis,
         "annualized": net_rate_ann is not None,
+        "annual_metric": ("monthly_mean_equiv" if annual_rate_override is not None else
+                          ("api_days" if net_rate_ann is not None else "none")),
         "net_profit": net_profit,
         "grade": grade_final,
         "grade_before_veto": grade,
@@ -189,6 +196,258 @@ def evaluate(total_return: float, token_cost_cny: float, capital: float,
                             or "评估期未到（2027-10-30 起评判）") if pending else ""),
         "eval_start": eval_start_date().isoformat(),
         "eval_as_of": as_d.isoformat(),
+    }
+
+
+# ============================================================================
+# 多周期加权评分（2026-11-25 用户拍板）
+# ============================================================================
+# 用户口径（m00796）：「引入新算法，季度收益 50%，年度收益 20%，三年收益 30%，
+# 不够三年计算到创始」；补一句（m00799）「都要折算成年化率」。
+# 于是三项**全部先折算成年化收益率**再加权 —— 这一步是必须的：季度 +1.0% 与年度
+# +3.0% 不是同一个量纲，直接加权会把季度结构性压扁（同样「一年 3%」的水平，
+# 三个月的数只值 0.75%）。折算成年化后，「加权年化收益率 ≥ 定存 1.30%」与
+# 「加权年化超额 ≥ 0」是同一个判据（因为权重和为 1），不必二选一。
+# 窗口默认**滚动**（12 周 / 52 周 / 3 年）：账本 2026-10-28 起步，若用自然季度，
+# 2026Q4 只剩 9 周、永远凑不满最小样本，前几期只能全是「样本不足」。
+
+
+def annualize_rate(ret: float | None, days: float | None) -> float | None:
+    """累计收益率 → 年化收益率。天数 <1 或 1+ret ≤ 0 时返回 None（不编数）。"""
+    if ret is None or days is None:
+        return None
+    try:
+        r, d = float(ret), float(days)
+    except (TypeError, ValueError):
+        return None
+    if d < 1.0 or (1.0 + r) <= 0.0:
+        return None
+    return (1.0 + r) ** (365.0 / d) - 1.0
+
+
+def composite(windows: dict, deposit_rate: float | None = None) -> dict:
+    """多周期加权：季 50% / 年 20% / 长期 30%，各窗口先折年化再加权。
+
+    ``windows`` = {"quarter": {"net_return": 累计净收益率, "days": 天数,
+                   "inception": 是否「计算到创始」}, "year": {...}, "long": {...}}
+    ``net_return`` 必须是**净**口径（账户收益 − 窗口内 token 实花，再 / 本金）。
+    未满 ``config.PERF.min_window_days`` 的窗口只显示、不参与加权（权重按比例
+    重分配给已满样本的窗口）；一个都不满 → score_ann=None，明确「样本不足，不判档」。
+    """
+    perf = getattr(config, "PERF", {}) or {}
+    weights = dict(perf.get("period_weights")
+                   or {"quarter": 0.50, "year": 0.20, "long": 0.30})
+    min_days = float(perf.get("min_window_days") or 84.0)
+    dep = float(deposit_rate if deposit_rate is not None else (perf.get("deposit_rate") or 0.0))
+
+    terms = {}
+    ok_keys = []
+    for key, w in weights.items():
+        raw = (windows or {}).get(key) or {}
+        nr, dys = raw.get("net_return"), raw.get("days")
+        ann = annualize_rate(nr, dys)
+        days_ok = dys is not None and float(dys) >= min_days
+        sample_ok = bool(ann is not None and days_ok)
+        terms[key] = {
+            "net_return": None if nr is None else float(nr),
+            "days": None if dys is None else float(dys),
+            "inception": bool(raw.get("inception")),
+            "ann_rate": ann,
+            "weight_nominal": float(w),
+            "weight_used": 0.0,
+            "sample_ok": sample_ok,
+            "min_days": min_days,
+        }
+        if sample_ok:
+            ok_keys.append(key)
+
+    avail = sum(terms[k]["weight_nominal"] for k in ok_keys)
+    score_ann = None
+    if ok_keys and avail > 0:
+        score_ann = 0.0
+        for k in ok_keys:
+            terms[k]["weight_used"] = terms[k]["weight_nominal"] / avail
+            score_ann += terms[k]["weight_used"] * terms[k]["ann_rate"]
+
+    excess = None if score_ann is None else score_ann - dep
+    return {
+        "terms": terms,
+        "weights": {k: float(v) for k, v in weights.items()},
+        "min_window_days": min_days,
+        "deposit_rate": dep,
+        "score_ann": score_ann,
+        "excess_ann": excess,
+        "sample_ok": bool(ok_keys),
+        "used_windows": ok_keys,
+        "missing_windows": [k for k in weights if k not in ok_keys],
+        "grade": grade_of(score_ann) if score_ann is not None else None,
+        "note": ("样本不足：季/年/长期都还没满最小窗口（%.0f 天），加权分只显示不判档"
+                 % min_days) if not ok_keys else
+                ("" if not [k for k in weights if k not in ok_keys] else
+                 "部分窗口未满最小样本，权重已按比例重分配给已满窗口"),
+        "basis": "各窗口净收益率先折年化，再按 季50%/年20%/长期30% 加权（权重和=1）",
+    }
+
+
+def windows_from_nav(navs: list, as_of=None, runs: list | None = None,
+                     capital: float | None = None, flows: list | None = None,
+                     token_in_nav: bool | None = None) -> dict:
+    """从账本净值点 + budget.json 的 runs 生成 composite() 需要的三个窗口。
+
+    - 窗口起点 = as_of − config.PERF.period_windows[key] 天；若账本起点更晚，
+      就退到账本起点并标 ``inception=True``（= 用户说的「不够三年计算到创始」）。
+    - 净收益率 = nav_end/nav_start − 1 − 窗口内 token 实花 / 本金。
+    - 窗口内 token 实花按 runs 的 ``ended_at``（缺则 ``started_at``）落在区间内求和。
+    """
+    perf = getattr(config, "PERF", {}) or {}
+    spans = dict(perf.get("period_windows")
+                 or {"quarter": 84, "year": 364, "long": 1095})
+    end_d = as_date(as_of)
+    pts = sorted(((as_date(n.get("date")), float(n.get("nav") or 0.0))
+                  for n in (navs or []) if n.get("date") and n.get("nav") is not None),
+                 key=lambda x: x[0])
+    if not pts:
+        return {}
+    cap = float(capital or 0.0)
+    out = {}
+    for key, span in spans.items():
+        start_d = end_d - __import__("datetime").timedelta(days=int(span))
+        prev = [p for p in pts if p[0] <= start_d]
+        inception = False
+        if prev:
+            s_d, s_nav = prev[-1]
+        else:
+            s_d, s_nav = pts[0]
+            inception = True
+        last = [p for p in pts if p[0] <= end_d]
+        if not last or s_nav <= 0:
+            continue
+        e_d, e_nav = last[-1]
+        days = max((e_d - s_d).days, 0)
+        # A1：注资是现金流不是收益——窗口末值先减掉窗口内到账的注资
+        _flow = 0.0
+        for _f in (flows or []):
+            try:
+                _fd = as_date((_f or {}).get("date"))
+                _fa = float((_f or {}).get("amount") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if s_d < _fd <= e_d:
+                _flow += _fa
+        gross = (e_nav - _flow) / s_nav - 1.0
+        tok = _token_in_window(runs, s_d, e_d)
+        # A5：token 已从现金扣掉（nav 净口径）时不能再减一次
+        _tinv = bool(token_in_nav)          # 默认 False：调用方负责声明「token 已在净值里」
+        tcr = 0.0 if _tinv else ((tok / cap) if cap > 0 else 0.0)
+        out[key] = {"net_return": gross - tcr, "days": float(days),
+                    "inception": inception, "gross_return": gross,
+                    "flow": round(_flow, 2), "token_in_nav": _tinv,
+                    "start": s_d.isoformat(), "end": e_d.isoformat(),
+                    "token_cost_cny": round(tok, 6), "token_cost_rate": tcr}
+    return out
+
+
+def evaluate_multi(windows: dict, deposit_rate: float | None = None) -> dict:
+    """composite() 的一行式封装：直接可进报表（字段名与 evaluate() 对齐）。"""
+    res = composite(windows, deposit_rate=deposit_rate)
+    res["bar_ok"] = bool(res["sample_ok"] and res["score_ann"] is not None
+                         and res["score_ann"] > res["deposit_rate"])
+    return res
+
+
+def _token_in_window(runs: list | None, start_d, end_d) -> float:
+    """窗口内 token 实花：按 runs 的 ``ended_at``（缺则 ``started_at``）落在 (start, end] 内求和。
+
+    单独抽出来是因为「滚动窗口」和「自然季」两处都要用同一套落窗规则，各写一遍必然漂移。
+    """
+    tok = 0.0
+    for r in (runs or []):
+        when = str(r.get("ended_at") or r.get("started_at") or "")[:10]
+        if not when:
+            continue
+        try:
+            w_d = as_date(when)
+        except ValueError:
+            continue
+        if start_d < w_d <= end_d:
+            tok += float(r.get("cost_cny") or 0.0)
+    return tok
+
+
+def quarter_metrics(navs: list, as_of=None, runs: list | None = None,
+                    capital: float | None = None, deposit_rate: float | None = None,
+                    flows: list | None = None, token_in_nav: bool | None = None) -> dict:
+    """**本自然季**累计（B-10② 的主指标）：季初 → as_of，口径与滚动窗口完全一致。
+
+    为什么主指标用「本季累计净收益率」而不是年化：5 万本金、往返摩擦 0.46%，
+    一个季度目标才 0.325%（162.5 元）——年化会把 27 天的噪声放大成 −4% 那种数字，
+    读者会以为策略一年要亏 4 个点。年化保留，但只作「外推值」脚注，不作达标判据。
+
+    - 起点 = 自然季首日；账本起步晚于季首就退到账本首个净值点并标 ``inception=True``
+      （首季只剩 9 周，永远凑不满 12 周最小样本，所以逐季滚动看的是「这一季拿了多少」，
+      而 12 周最小样本闸只管「判不判档」，两者不是一回事）。
+    - 净收益率 = nav_end/nav_start − 1 − 季内 token 实花 / 本金。
+    - 目标 = ``config.PERF.accept_quarter_rate``（= 年化达标线 / 4）× 本金。
+    """
+    perf = getattr(config, "PERF", {}) or {}
+    dep = float(deposit_rate if deposit_rate is not None else (perf.get("deposit_rate") or 0.0))
+    target_rate = perf.get("accept_quarter_rate")
+    if target_rate is None:
+        target_rate = dep / 4.0
+    target_rate = float(target_rate)
+
+    end_d = as_date(as_of)
+    pts = sorted(((as_date(n.get("date")), float(n.get("nav") or 0.0))
+                  for n in (navs or []) if n.get("date") and n.get("nav") is not None),
+                 key=lambda x: x[0])
+    if not pts:
+        return {"available": False, "note": "账本还没有净值点"}
+    last = [p for p in pts if p[0] <= end_d]
+    if not last:
+        return {"available": False, "note": f"{end_d.isoformat()} 之前没有净值点"}
+    e_d, e_nav = last[-1]
+    q_start = e_d.replace(month=((e_d.month - 1) // 3) * 3 + 1, day=1)
+    prev = [p for p in pts if p[0] <= q_start]
+    inception = False
+    if prev:
+        s_d, s_nav = prev[-1]
+    else:
+        s_d, s_nav = pts[0]
+        inception = True
+    if s_nav <= 0:
+        return {"available": False, "note": "季初净值为 0，无法算收益率"}
+    days = max((e_d - s_d).days, 0)
+    _flow = 0.0
+    for _f in (flows or []):
+        try:
+            _fd = as_date((_f or {}).get("date"))
+            _fa = float((_f or {}).get("amount") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if s_d < _fd <= e_d:
+            _flow += _fa
+    gross = (e_nav - _flow) / s_nav - 1.0
+    cap = float(capital or 0.0)
+    tok = _token_in_window(runs, s_d, e_d)
+    _tinv = bool(token_in_nav)          # 默认 False：调用方负责声明「token 已在净值里」
+    tcr = 0.0 if _tinv else ((tok / cap) if cap > 0 else 0.0)
+    net_return = gross - tcr
+    target_cny = (cap * target_rate) if cap > 0 else None
+    return {
+        "available": True,
+        "quarter": f"{e_d.year}Q{(e_d.month - 1) // 3 + 1}",
+        "start": s_d.isoformat(), "end": e_d.isoformat(), "days": days,
+        "inception": inception, "period": str(perf.get("period") or "quarter"),
+        "gross_return": gross, "token_cost_cny": round(tok, 6), "token_cost_rate": tcr,
+        "net_return": net_return,
+        "net_annualized_extrapolated": annualize_rate(net_return, days),
+        "target_rate": target_rate,
+        "target_cny": None if target_cny is None else round(target_cny, 2),
+        "excess_return": net_return - target_rate,
+        "excess_cny": None if target_cny is None else round(cap * (net_return - target_rate), 2),
+        "bar_ok": bool(net_return >= target_rate),
+        "basis": "本季累计净收益率 =（季末净值/季初净值 − 1）− 季内 token 实花/本金；"
+                 "目标 = 年化达标线/4；年化值仅作外推参考",
     }
 
 
@@ -301,3 +560,62 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def monthly_equivs(navs, as_of=None, flows=None):
+    """按月切窗口，算每个月的「等价年化率」（2026-11-26 用户拍板口径）。
+
+    ``days`` = 该窗口**实际运行天数**（起点 → 月内最后一个净值点），不是固定 30 天。
+    起点用「上一个月最后一个净值点」，因为注资在月初到账、记在当月：
+    用当月首点做起点会把 5,000 当成当月涨幅（A1）。窗口内到账的注资从末值减掉
+    （注资是现金流，不是收益）。月末净值已扣 token（capital_dyn.book_token 先现金出账），
+    所以是净口径，不再二次扣。
+    """
+    buckets = {}
+    for n in sorted([x for x in (navs or []) if x.get("date") and x.get("nav") is not None],
+                    key=lambda x: str(x["date"])):
+        buckets.setdefault(str(n["date"])[:7], []).append(n)
+    chrono = sorted([x for x in (navs or []) if x.get("date") and x.get("nav") is not None],
+                    key=lambda x: str(x["date"]))
+    out = []
+    for mth in sorted(buckets):
+        rows = buckets[mth]
+        prev = [x for x in chrono if str(x["date"]) < f"{mth}-01"]
+        base_row = prev[-1] if prev else rows[0]
+        rec = {"month": mth, "start": str(base_row["date"]), "end": str(rows[-1]["date"]),
+               "points": len(rows), "days": 0, "r": None, "equiv": None, "pnl": None,
+               "flow": 0.0}
+        # 起点是上月最后一点时，本月哪怕只有 1 个净值点也能算（A1：注资月初到账）。
+        if rows and base_row is not None:
+            try:
+                d0 = as_date(base_row["date"])
+                d1 = as_date(rows[-1]["date"])
+                rec["days"] = int((d1 - d0).days)
+            except Exception:  # noqa: BLE001
+                rec["days"] = 0
+            _flow = 0.0
+            for _f in (flows or []):
+                try:
+                    _fd = as_date((_f or {}).get("date"))
+                    _fa = float((_f or {}).get("amount") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if d0 < _fd <= d1:
+                    _flow += _fa
+            rec["flow"] = round(_flow, 2)
+            v0 = float(base_row["nav"])
+            v1 = float(rows[-1]["nav"])
+            if v0:
+                rec["r"] = (v1 - _flow) / v0 - 1.0
+                rec["pnl"] = round(v1 - v0 - _flow, 2)
+            if rec["r"] is not None and rec["days"] >= 1 and (1.0 + rec["r"]) > 0:
+                rec["equiv"] = (1.0 + rec["r"]) ** (365.0 / rec["days"]) - 1.0
+        out.append(rec)
+    return out
+
+
+
+def monthly_mean_equiv(series):
+    """各月等价年化率的**算术平均**（年报定档口径；不是几何/复利平均）。"""
+    vals = [float(x["equiv"]) for x in (series or []) if x.get("equiv") is not None]
+    return (sum(vals) / len(vals)) if vals else None

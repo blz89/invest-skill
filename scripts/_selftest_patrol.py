@@ -201,7 +201,27 @@ def main() -> int:
         patrol.check_rates = lambda today, refresher=None: {
             "ok": True, "live": True, "repo": 0.0125, "money_fund": 0.0108,
             "as_of": "2026-10-29", "drift_bp": 0.0, "alerts": [], "notes": []}
-        res = patrol.run("2026-10-29")
+        # 2026-11-26 审计 A2：run(write=True) 会经 housekeeping 写生产 daily_log.md 并
+        # sweep 生产 WORK；check_sentiment 还会联网抓热股榜。自检必须全部隔离/打桩。
+        import hashlib
+
+        import housekeeping as HK
+        _prod_log = HK.LOG_PATH
+        _prod_sha = (hashlib.sha256(io.open(_prod_log, "rb").read()).hexdigest()
+                     if os.path.isfile(_prod_log) else None)
+        _old_log, _old_sweep = HK.LOG_PATH, HK.sweep
+        _old_sent = patrol.check_sentiment
+        HK.LOG_PATH = os.path.join(tmp, "daily_log.md")
+        HK.sweep = lambda *a, **k: {}
+        patrol.check_sentiment = lambda day: {"ok": False, "alerts": [],
+                                              "notes": ["selftest stub"]}
+        try:
+            res = patrol.run("2026-10-29")
+        finally:
+            HK.LOG_PATH, HK.sweep, patrol.check_sentiment = _old_log, _old_sweep, _old_sent
+        _prod_sha2 = (hashlib.sha256(io.open(_prod_log, "rb").read()).hexdigest()
+                      if os.path.isfile(_prod_log) else None)
+        check("run() 不写生产 daily_log.md", _prod_sha == _prod_sha2, _prod_log)
         check("run() 汇总 n_alerts > 0", res["n_alerts"] > 0, str(res["n_alerts"]))
         check("run() 汇总 n_high ≥ 1", res["n_high"] >= 1, str(res["n_high"]))
         check("run() 写出 patrol_latest.json",
@@ -358,13 +378,13 @@ def main() -> int:
             config.PAPER["ledgers"] = old_ledgers
         shutil.rmtree(tmp, ignore_errors=True)
 
-    # ---------- 12) 排班口径（2026-10-31 改定：决策只周六、巡检取最近交易日）----------
-    print("12) 排班口径：决策日只有周六、巡检按最近交易日")
+    # ---------- 12) 排班口径（2026-11-25 改定：周三/周六双决策、巡检取最近交易日）----------
+    print("12) 排班口径：周三/周六双决策、巡检按最近交易日")
     import datetime as _dt
     import report_html as _rh
-    check("2026-10-30（周五）→ 下次决策 10-31 周六", _rh.next_decision_day("2026-10-30") == ("2026-10-31", "周六"))
-    check("2026-10-31（周六）→ 下次决策 11-07", _rh.next_decision_day("2026-10-31") == ("2026-11-07", "周六"))
-    check("周三不再算决策日（10-28 → 10-31）", _rh.next_decision_day("2026-10-28") == ("2026-10-31", "周六"))
+    check("2026-11-25（周三）→ 下次决策 11-28 周六", _rh.next_decision_day("2026-11-25") == ("2026-11-28", "周六"))
+    check("2026-11-28（周六）→ 下次决策 12-02 周三", _rh.next_decision_day("2026-11-28") == ("2026-12-02", "周三"))
+    check("2026-11-26（周四）→ 下次决策 11-28 周六", _rh.next_decision_day("2026-11-26") == ("2026-11-28", "周六"))
     _w = {a[0]: a[2] for a in patrol.WATCH}
     check("决策日产物新鲜度阈值 = 8 天（周更，不会周二误报）",
           all(_w.get(k) == 8 for k in ("stage1_candidates.csv", "stage3_plan.json",
@@ -805,16 +825,13 @@ def main() -> int:
             return {"date": ["2026-11-19", "2026-11-20"], "value": [1.05, 1.06]}
 
         patrol.datasource.fetch_fund_nav_history = _fake_nav13
-        navs13 = patrol._otc_navs(st13)
-        check("_otc_navs 用 6 位代码 + 累计净值取数",
+        n13 = patrol.otc_book.refresh_navs(st13, "2026-11-20")
+        check("refresh_navs 用 6 位代码 + 累计净值取数",
               seen13.get("code") == "016800" and seen13.get("indicator") == "累计净值走势",
               str(seen13))
-        check("_otc_navs 返回逐日序列",
-              navs13.get("OTC:016800") == [("2026-11-19", 1.05), ("2026-11-20", 1.06)],
-              str(navs13))
-        patrol.otc_book.mark(st13, navs13)
+        check("refresh_navs 刷新只数 = 1", n13 == 1, str(n13))
         h13 = st13["otc_holdings"]["OTC:016800"]
-        check("otc_book.mark 后 nav_date 跟上最新披露日",
+        check("refresh_navs 后 nav_date 跟上最新披露日",
               h13.get("nav_date") == "2026-11-20" and abs(float(h13.get("nav") or 0) - 1.06) < 1e-9,
               str(h13))
 
@@ -822,9 +839,10 @@ def main() -> int:
             raise RuntimeError("网络抽风")
 
         patrol.datasource.fetch_fund_nav_history = _boom13
-        check("_otc_navs 取数失败不抛（沿用旧净值）", patrol._otc_navs(st13) == {}, "应返回空表")
+        check("refresh_navs 取数失败不抛（沿用旧净值）",
+              patrol.otc_book.refresh_navs(st13, "2026-11-20") == 0, "应返回 0")
         check("无场外持仓时不取数",
-              patrol._otc_navs({"meta": {}, "otc_holdings": {}}) == {}, "")
+              patrol.otc_book.refresh_navs({"meta": {}, "otc_holdings": {}}, "2026-11-20") == 0, "")
     finally:
         patrol.datasource.fetch_fund_nav_history = _old_nav13
     # ---------- 14) 情绪层体检：key / 接口 / 产物 ----------
@@ -1059,6 +1077,26 @@ def main() -> int:
               bool(_unk18) and "补映射" in _unk18[0]["action"], str(_unk18))
         check("已知行业超限仍提示减仓（分支没误伤）",
               bool(_known) and all("优先减" in a["action"] for a in _known), str(_ov18))
+
+        # ---------- 18e) 宽基 ETF 不算「未分类」，也不占行业额度 ----------
+        st18e = mk_state(cash=0.0, holdings=[
+            {"code": "sh510050", "name": "上证50ETF华夏", "kind": "etf", "layer": "ETF",
+             "level": "R3", "shares": 1000, "cost_basis": 2.0, "opened_at": "2026-06-01",
+             "last_buy_date": "2026-06-01", "last_close": 3.0, "highest_close": 3.0,
+             "stop_price": None, "industry": "", "target_price": None,
+             "thesis": None, "falsifiers": []},
+            hold("600777", "已知乙", shares=1000, cost=10.0, last=10.0, industry="银行"),
+        ])
+        with io.open(os.path.join(tmp18, "s18.json"), "w", encoding="utf-8") as f:
+            json.dump(st18e, f, ensure_ascii=False)
+        one18e = patrol.check_ledger("t18", "2026-10-29")
+        check("宽基 ETF 无行业字段不算「未分类」",
+              not any(a["kind"] == "行业映射缺失" for a in one18e["alerts"]),
+              str(kinds(one18e)))
+        check("宽基 ETF 不占行业额度：银行按权益层分母 76.9% 报超限",
+              any(a["kind"] == "行业超限" and "76.9%" in a["detail"]
+                  for a in one18e["alerts"]),
+              str([a["detail"] for a in one18e["alerts"] if a["kind"] == "行业超限"]))
 
         # ---------- 18f) 场外净值陈旧按交易日算（长假不误报）----------
         _old_cal18 = patrol.datasource.fetch_trade_calendar

@@ -150,6 +150,17 @@ def main():
         cninfo._cached = orig_cached
 
     print("\n== F. 溯源落盘 ==")
+    # 2026-11-26 审计 A3：dump_provenance() 默认写生产 cache/cninfo_provenance.json，
+    # 自检必须把 PROV_FILE 指到临时目录，并断言生产文件 hash 未变。
+    import hashlib
+    import shutil
+    import tempfile
+
+    _prov_tmp = tempfile.mkdtemp(prefix="cninfo_prov_")
+    _prod_prov, cninfo.PROV_FILE = cninfo.PROV_FILE, os.path.join(
+        _prov_tmp, "cninfo_provenance.json")
+    _prod_sha = (hashlib.sha256(open(_prod_prov, "rb").read()).hexdigest()
+                 if os.path.isfile(_prod_prov) else None)
     cninfo._PROV.clear()
     cninfo._prov_add("announcement", "601058:test", 2, "unit-test")
     payload = cninfo.dump_provenance()
@@ -161,6 +172,11 @@ def main():
     check("溯源含 rows/fetched_at",
           all(k in on_disk["items"][0] for k in ("rows", "fetched_at", "kind", "key")))
     check("dump 返回值与落盘一致", payload["items"][0]["key"] == "601058:test")
+    cninfo.PROV_FILE = _prod_prov
+    _prod_sha2 = (hashlib.sha256(open(_prod_prov, "rb").read()).hexdigest()
+                  if os.path.isfile(_prod_prov) else None)
+    check("溯源不写生产文件", _prod_sha == _prod_sha2, _prod_prov)
+    shutil.rmtree(_prov_tmp, ignore_errors=True)
 
     print("\n== G. 全市场增量流（mock，不联网） ==")
     fake = [

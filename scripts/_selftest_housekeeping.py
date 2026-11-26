@@ -337,7 +337,8 @@ def test_sweep(_root, _work, _out, cache, out):
         shutil.rmtree(os.path.join(cache, d), ignore_errors=True)
     _mkcache(cache, "k1", ["2026-10-28", "2026-10-29", "2026-10-30"])
     r = HK.sweep(today="2026-10-30")
-    check("sweep 返回 cache+patrol_md+paper", set(r) == {"cache", "patrol_md", "paper"}, r)
+    check("sweep 返回 cache+patrol_md+paper+archive",
+          set(r) == {"cache", "patrol_md", "paper", "archive"}, r)
     check("sweep 保留 2 天", r["cache"]["keep_last"] == 2, r["cache"])
     check("sweep 删掉 1 个旧快照", r["cache"]["deleted"] == 1, r["cache"])
 
@@ -387,6 +388,39 @@ def test_week(root, work, out, cache):
             config.PAPER["ledgers"] = old_lg
 
 
+def test_archive(work):
+    """每日快照目录保留（2026-11-26 清冗余）：只删纯日期且超期的；回滚目录与最新一份不动。"""
+    root = HK.archive_root()
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    for d in ["2026-11-01", "2026-11-10", "2026-11-24", "2026-11-26",
+              "2026-11-26_pre_fresh_start", "_legacy_cache"]:
+        os.makedirs(os.path.join(root, d), exist_ok=True)
+        with io.open(os.path.join(root, d, "x.bin"), "wb") as f:
+            f.write(b"x" * (700 * 1024))  # 每份 700KB，让 freed_mb 有可读数字
+    to_del, stats = HK.plan_archive_prune(keep_days=7, today="2026-11-26")
+    got = sorted(os.path.basename(p) for p in to_del)
+    check("每日快照：只删超期纯日期目录", got == ["2026-11-01", "2026-11-10"], str(got))
+    check("每日快照：回滚目录不删", os.path.isdir(os.path.join(root, "2026-11-26_pre_fresh_start")))
+    r = HK.prune_archive(keep_days=7, today="2026-11-26", dry=True)
+    check("每日快照：dry 只报不删",
+          r["ok"] and r["deleted"] == 2 and os.path.isdir(os.path.join(root, "2026-11-01")), str(r))
+    r = HK.prune_archive(keep_days=7, today="2026-11-26")
+    check("每日快照：实删 2 个并释放空间",
+          r["ok"] and r["deleted"] == 2 and r["freed_mb"] > 0
+          and not os.path.isdir(os.path.join(root, "2026-11-01")), str(r))
+    check("每日快照：保留期内不动", os.path.isdir(os.path.join(root, "2026-11-24")))
+    check("每日快照：sweep 带 archive 项", "archive" in HK.sweep(dry=True))
+    # 安全阀：超期目录占比 >80% 时拒删（防日期解析/路径配错）
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    for d in ["2026-11-01", "2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"]:
+        os.makedirs(os.path.join(root, d))
+    r = HK.prune_archive(keep_days=1, today="2026-11-26")
+    check("每日快照：>80% 拒删并给原因", r["ok"] is False and "拒删" in r["error"], str(r))
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     root, work, out, cache = _sandbox()
     try:
@@ -396,6 +430,7 @@ def main():
         test_prune(cache)
         test_guard(cache)
         test_patrol_md(out)
+        test_archive(work)
         test_paper_reports(out)
         test_build_row(out)
         test_ledger_stats(out)

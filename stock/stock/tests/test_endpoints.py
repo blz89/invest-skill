@@ -16,7 +16,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]          # <本技能目录>\stock\stock
+ROOT = Path(__file__).resolve().parents[1]          # D:\skills\invest\stock\stock
 ENDPOINTS = ROOT / "endpoints"
 
 EXPECTED = [

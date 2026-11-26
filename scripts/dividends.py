@@ -12,6 +12,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import config  # noqa: E402,F401  先 import config：它把 stock 数据层注入 sys.modules
+
 import datasource  # noqa: E402
 
 

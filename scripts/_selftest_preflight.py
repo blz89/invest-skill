@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import atexit
+import shutil
 import os
 import sys
 import tempfile
@@ -17,9 +19,12 @@ sys.path.insert(0, HERE)
 import preflight  # noqa: E402
 
 FAILED = []
+TOTAL = 0
 
 
 def check(name, ok, extra=""):
+    global TOTAL
+    TOTAL += 1
     print(("  ✓ " if ok else "  ✗ ") + name + (f"｜{extra}" if extra and not ok else ""))
     if not ok:
         FAILED.append(name)
@@ -55,6 +60,7 @@ def state_doc(capital=50000.0, nav=None):
 
 def run_case(td=TD, plan=None, funnel=None, summary=None, state=None, logs_name=None):
     tmp = tempfile.mkdtemp(prefix="preflight_")
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     outdir = os.path.join(tmp, "out")
     logs = os.path.join(tmp, "logs")
     os.makedirs(outdir)
@@ -141,6 +147,7 @@ check("只有前一日摘要 → 日摘要 FAIL",
 
 print("=== 7. collect：账本读不出 → 追加 FAIL，不抛异常 ===")
 tmp = tempfile.mkdtemp(prefix="preflight_bad_")
+atexit.register(shutil.rmtree, tmp, ignore_errors=True)
 outdir = os.path.join(tmp, "out")
 os.makedirs(outdir)
 items = preflight.collect(outdir, os.path.join(tmp, "logs"),
@@ -150,7 +157,7 @@ check("账本读不出 → 账本 FAIL", "账本可读" in m and m["账本可读
 check("其余判据仍全部返回", len(items) == 5, str(len(items)))
 
 print()
-print(f"断言：{len(FAILED) and '有失败' or '全部通过'}｜失败 {len(FAILED)} 项")
+print(f"断言：{TOTAL} 项｜通过 {TOTAL - len(FAILED)} 项｜失败 {len(FAILED)} 项")
 if FAILED:
     for f in FAILED:
         print("  - " + f)

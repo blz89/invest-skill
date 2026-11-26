@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import atexit
+import shutil
 import os
 import sys
 
@@ -334,6 +336,7 @@ st16["otc_holdings"]["OTC:012310"] = {
     "nav_date": "2026-10-28", "redeem_fee_hold": 0.0}
 _e16 = paper.settle(st16, "2026-10-30", {"600000": 10.0})
 _tmp16 = os.path.join(tempfile.mkdtemp(prefix="otc_review_"), "state.json")
+atexit.register(shutil.rmtree, os.path.dirname(_tmp16), ignore_errors=True)
 with open(_tmp16, "w", encoding="utf-8") as f:
     json.dump(st16, f, ensure_ascii=False)
 _res16 = review.one_ledger("t", {"state_file": _tmp16, "capital": 50000.0,
@@ -359,6 +362,103 @@ check("已落账" in _h16 and "在途" in _h16,
 check("本期利息 0.00" not in _h16,
       "传 cash_int 后不再出现「本期利息 0.00」")
 check("15.00" in _h16, "合计利息与 cash_interest_split 同源（15.00）")
+
+print("22) 赎回费按实际持有天数取实测档（2026-11-25 A 类：不再「<90 天一律 1.5%」）")
+# 为什么锁这条：旧实现把「持有 <90 天」当 1.5% 硬编码，与实测费表矛盾 —— 011984 满 7 天即 0%，
+# 巡检于是把「随时可零费赎回」误报成「赎回费 34.5 元、别动」。这里用真实费表缓存钉死三档。
+# 费表走实时接口；CI 离线取不到 → 用夹具阶梯钉死档位（有真实费表则走真实值）。
+import otc  # noqa: E402 —— 赎回费阶梯夹具用
+_orig_ladder = otc.redeem_ladder
+if not otc.redeem_ladder("011984")[0]:
+    _FIX_LADDER = {"011984": (["小于7天"], [1.5]), "016800": (["--"], [0.0])}
+    otc.redeem_ladder = lambda code: _FIX_LADDER.get(str(code), ([], []))
+otc_book._LADDER_CACHE.clear()
+_h11 = {"code": "OTC:011984", "buy_date": "2026-11-02", "redeem_fee_hold": 0.0}
+check(abs(otc_book.redeem_fee_rate(_h11, "2026-11-09") - 0.0) < 1e-9,
+      f"011984 持有 7 天 → 0.00%（实测 {otc_book.redeem_fee_rate(_h11, '2026-11-09')}）")
+check(abs(otc_book.redeem_fee_rate(_h11, "2026-11-02") - 0.015) < 1e-9,
+      f"011984 持有 0 天 → 1.50%（实测 {otc_book.redeem_fee_rate(_h11, '2026-11-02')}）")
+_h16b = {"code": "OTC:016800", "buy_date": "2026-11-02", "redeem_fee_hold": 0.0}
+check(abs(otc_book.redeem_fee_rate(_h16b, "2026-11-23") - 0.0) < 1e-9,
+      "016800 费表只有 `---`/0.0 → 任何持有天数都 0%（不是 1.5%）")
+check("实测" in otc_book.redeem_fee_basis(_h11, "2026-11-09"),
+      f"basis 标「实测档」（实际 {otc_book.redeem_fee_basis(_h11, '2026-11-09')}）")
+_hneg = {"code": "OTC:011984", "buy_date": "2026-11-20", "redeem_fee_hold": 0.0}
+check(otc_book.redeem_fee_rate(_hneg, "2026-11-02") > 0,
+      "buy_date 晚于估值日（负数持有天数）要按最短档算，不能落到 min(费率)=0 的假免费")
+_rows22 = otc_book.holdings_rows(
+    {"otc_holdings": {"OTC:011984": dict(_h11, name="永赢", amount=2300.0, nav=1.2077,
+                                         acc_nav=1.1614, nav_date="2026-11-23",
+                                         buy_date="2026-11-02", level="R2",
+                                         layer="理财(R2)", redeem_fee_hold=0.0)},
+     "otc_orders": [], "otc_trades": []})
+check(all("redeem_fee_basis" in r for r in _rows22), "持仓行带 redeem_fee_basis（报表要标口径）")
+otc.redeem_ladder = _orig_ladder
+otc_book._LADDER_CACHE.clear()
+
+print("23) 产品持有期内不生成赎回单（2026-11-25 B-11 配套：纪律管不了合同锁定期）")
+# 为什么锁这条：018193「180 天持有期」2026-11-02 买入 → 2027-05-01 才能赎；目标池换掉它时
+# 旧实现会直接生成「全额赎回」单，等于下一张根本执行不了的单，还会占住 reserved 现金。
+check(otc_book.product_lock_days("OTC:018193", "建信鑫弘180天持有期债券C") == 180,
+      f"018193 命名解析出 180 天（实际 {otc_book.product_lock_days('OTC:018193', '建信鑫弘180天持有期债券C')}）")
+check(otc_book.product_lock_days("OTC:016800", "建信鑫和30天持有期债券C") == 30,
+      "016800 命名解析出 30 天")
+check(otc_book.product_lock_days("OTC:011984", "永赢中债3-5年政金债指数C") == 0,
+      "011984 无持有期 → 0")
+_st23 = fresh()
+make = otc_book.make(_st23, "2026-11-02", "2026-11-03", "OTC:018193",
+                     "建信鑫弘180天持有期债券C", "buy", 2300.0,
+                     nav_ref=1.1314, nav_ref_date="2026-11-02", nav_ref_cum=1.1314)
+otc_book.resolve(_st23, "2026-11-04", {"OTC:018193": series({"2026-11-03": 1.1314})})
+_h23 = _st23["otc_holdings"].get("OTC:018193")
+check(bool(_h23), "018193 持仓已建")
+_ord23 = otc_book.target_orders(_st23, "2026-11-24", "2026-11-25", [], 
+                                {"OTC:018193": series({"2026-11-24": 1.1315})},
+                                cash_available=50000.0, allow=True)
+check(_ord23 == [], f"目标池里没有它 + 未到持有期 → 不生成赎回单（实际 {_ord23}）")
+_ord23b = otc_book.target_orders(
+    _st23, "2026-11-24", "2026-11-25",
+    [{"code": "OTC:018193", "name": "建信鑫弘180天持有期债券C", "amount": 100.0,
+      "fee": 0.0, "redeem_fee_hold": 0.0, "min_purchase": 10.0}],
+    {"OTC:018193": series({"2026-11-24": 1.1315})},
+    cash_available=50000.0, allow=True)
+check(_ord23b == [], f"目标降到 100 元（要减仓）+ 未到持有期 → 也不生成赎回单（实际 {_ord23b}）")
+check(otc_book._lock_left(_h23, "2026-11-24") > 0,
+      f"剩余锁定天数 >0（实际 {otc_book._lock_left(_h23, '2026-11-24')}）")
+check(otc_book._lock_left(_h23, "2027-05-02") <= 0,
+      "过了 2027-05-01 → 锁定解除，可以赎")
+
+print("=" * 78)
+print("24) refresh_navs：巡检与 paper_exec 共用同一入场刷新入口（修双结算漂移）")
+_st24 = fresh()
+otc_book.ensure(_st24)
+_st24["otc_holdings"]["OTC:016800"] = {
+    "code": "OTC:016800", "name": "建信鑫和30天持有期债券C", "layer": "R2", "level": 2,
+    "amount": 2400.0, "acc_nav": 1.15, "nav": 1.15, "nav_date": "2026-11-20",
+    "buy_date": "2026-11-02", "confirm_date": None, "redeem_fee_hold": 0.0,
+}
+import types as _types
+_orig_ds = sys.modules.get("datasource")
+sys.modules["datasource"] = _types.SimpleNamespace(
+    fetch_fund_nav_history=lambda code, kind=None: {
+        "date": ["2026-11-20", "2026-11-21", "2026-11-24"],
+        "value": [1.15, 1.152, 1.16],
+    })
+try:
+    _n24 = otc_book.refresh_navs(_st24, "2026-11-24")
+    _h24 = _st24["otc_holdings"]["OTC:016800"]
+    check(_n24 == 1, f"刷新只数 = 1（实际 {_n24}）")
+    check(abs(float(_h24["nav"]) - 1.16) < 1e-9, f"nav 刷到 11-24 的 1.16（实际 {_h24['nav']}）")
+    check(_h24["nav_date"] == "2026-11-24", f"nav_date = 2026-11-24（实际 {_h24['nav_date']}）")
+    check(otc_book.refresh_navs(fresh(), "2026-11-24") == 0, "空仓刷新返回 0（不调数据层）")
+    otc_book.refresh_navs(_st24, "2026-11-21")
+    check(abs(float(_h24["nav"]) - 1.152) < 1e-9,
+          "as_of 过滤：11-21 只取 <=11-21 的净值（1.152）")
+finally:
+    if _orig_ds is not None:
+        sys.modules["datasource"] = _orig_ds
+    else:
+        sys.modules.pop("datasource", None)
 
 print("=" * 78)
 if BAD:

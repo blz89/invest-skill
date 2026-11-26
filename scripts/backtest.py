@@ -50,6 +50,8 @@ def _f2(x, nd=2):
 CAP = config.CAPITAL
 EXEC = config.EXEC
 MIN_POS = CFG.get("min_position_value", 800.0)
+# B 类修复（2026-11-26）：回测 ETF 承接层只数必须与线上「权益比例 → ETF 只数」档位一致
+ETF_N_BY_RATIO = [(0.35, 1), (0.60, 2), (1.0, 3)]
 
 # 参数覆盖：按区间扫描 B 类参数（状态阈值/档位/止损/集中度）。默认值与线上 config 同源，
 # 只有显式传入 params 时才偏离；用于「同一规则、不同参数」的对比，不改变线上行为。
@@ -195,7 +197,9 @@ def build_target(pool: list[dict], capital: float, equity_ratio: float,
     budget = round(capital * equity_ratio, 2)
     n_by_budget = int(budget // MIN_POS)
     n_by_cap = max(1, int(math.ceil(equity_ratio / p["max_single"] - 1e-9)))
-    n = max(0, min(p["max_etf_n"], n_by_budget, n_by_cap))
+    n_ratio = next((int(k) for cap_r, k in ETF_N_BY_RATIO if equity_ratio <= cap_r + 1e-9),
+                   int(p["max_etf_n"]))
+    n = max(0, min(n_ratio, n_by_budget, n_by_cap))
     if n == 0:
         return {"targets": {}, "budget": budget, "note": "预算不足单笔最小"}
     per = min(budget / n, capital * p["max_single"])
@@ -274,12 +278,13 @@ def run(capital: float, tier: str, start: str, end: str, decisions: str = "wed_s
             print(f"  ! {sym} 取数失败：{e}")
     bench = Series(ds.fetch_index_daily("000300"))
 
-    # 决策日：**历史回测假定双决策日**（周三/周六），与 2026-10-31 起的线上「每周六一次」不同；
-    # 这样回测样本更多、更保守，结论仍可参考，但不代表线上节奏。
+    # 决策日：历史回测按双决策日（周三/周六）回放；2026-11-25 起线上也改为每周三、周六 20:30
+    # 双决策，与 `wed_sat` 口径一致（B12：旧注释「不代表线上节奏」已过时）。
     # 周三（数据到周三收盘，周四开盘成交）/ 周六（数据到周五收盘，周一开盘成交）
-    # 交易日历里周六不是交易日（交易所周六不开市），所以「周六决策」落成「周五决策」：
-    # as_of=周五收盘、fill=下周一开盘；想同时看周三节奏用 wed_sat。
-    want = {"wed_sat": (2, 4), "wed": (2,), "sat": (4,), "week": (4,)}[decisions]
+    # 交易日历里周六不是交易日（交易所周六不开市），所以 `--decisions sat` 落成「周五决策」：
+    # as_of=周五收盘、fill=次一交易日开盘；想同时看周三节奏用 wed_sat。
+    # week = 每周两个决策日（周三、周六），与线上 2026-11-25 起的 wed_sat 同义
+    want = {"wed_sat": (2, 4), "wed": (2,), "sat": (4,), "week": (2, 4)}[decisions]
     decision_days = sorted({d for d in cal if d0 <= d <= d1 and d.weekday() in want})
     plan_list = []
     for d in decision_days:
@@ -662,7 +667,7 @@ def report(res: dict) -> str:
     lines = ["# 历史回放报告（市场状态 + ETF 打分）", "",
              f"- 区间：{p['start']} → {p['end']}（{p['days']} 天，{p['decisions']} 次决策）",
              f"- 本金：{p['capital']:,.0f} 元 · {p['tier']} 档 · 调仓模式 {p['rebalance']} · "
-             f"{'含' if p['stops'] else '不含'}止损 · 回测假定周三/周六决策、次一交易日开盘成交（线上为每周六一次；且"
+             f"{'含' if p['stops'] else '不含'}止损 · 回测假定周三/周六双决策、次一交易日开盘成交（与线上每周三、周六 20:30 一致；且"
              f"买入已改限价条件单，回测按开盘价买入，成交假设偏乐观）",
              f"- 标的池：{'PIT 全集（' + str(p.get('pool_n', 0)) + ' 只，按当日数据判合格 → 无生存者偏差）' if p.get('pool') == 'pit' else '今日筛选结果（' + str(p.get('pool_n', 0)) + ' 只，有生存者偏差、结果偏乐观）'}",
              f"- 期末：策略 {res['final']['nav']:,.2f} 元 vs 沪深300 {res['final']['bench_nav']:,.2f} 元", "",

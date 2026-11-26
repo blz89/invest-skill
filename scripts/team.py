@@ -28,6 +28,7 @@ import sys
 
 import config
 import billing
+import paper
 import score
 
 T = config.TEAM
@@ -214,7 +215,7 @@ def task_T4(st: dict) -> str:
 
 
 def task_T8(st: dict) -> str:
-    return f"""# T8 月报记分卡：评分（只在月报做）
+    return f"""# T8 记分卡：数字每月可跑，档位只在年报出（2026-11-26 用户拍板）
 
 {_role_block('report')}
 ## 自动完成（代码，不需要 LLM）
@@ -255,7 +256,7 @@ def task_T9(st: dict) -> str:
 - 不许跳过审计直接改账本。
 - 不许为了拿 A 去破风控（regime 仓位上限、单票上限、MDD 否决）。
 - **骨架不算交卷**：`do_t9` 生成的骨架带 `T9_SKELETON` 标记，`--ingest T9` 会拒收；四段齐全、正文 ≥200 字、删掉该标记才算交卷。
-- **决策日不评分**：评分/记分卡只在月报做（`team.py --run-t8`），周决策这一期只写事实、决策与计划，不写评级和奖励。
+- **决策日不评分**：档位/奖励只在年报出（`team.py --run-t8 --annual`）；周决策与月报只写事实、数字与计划，不写评级和奖励。
 
 ## 你是执行者（只做这一步）
 
@@ -274,7 +275,7 @@ def task_T10(st: dict) -> str:
 {_role_block('review')}
 ## 一、五层（原有，保留）
 1. **L1 归因**：现金 carry / R2 carry / R3 beta / alpha（alpha 不可测，直接写"不可测"）
-2. **L2 记分卡**：本期评分 + 12 期分布 vs 目标 {config.SCORE['dist_target']}
+2. **L2 记分卡**：本期数字（收益/token/净收益率/季进度）+ 12 期分布（档位在年报出）vs 目标 {config.SCORE['dist_target']}
 3. **L3 可证伪巡检**：把历史写下的 `falsify_cond` 逐条回查，触发的标红
 4. **L4 诊断树**：token 成本率 > 0.30% → 现金 carry < 1.0% → R2 实际占比 < 名义 → 权益 beta 为负 → 参数复核
 5. **L5 参数复核**：只许动可回测层（现金容器/网格间距/再平衡阈值），每次只改一个参数
@@ -569,13 +570,13 @@ def ingest(sid: str, capital: float, ledger: str, dry: bool = False) -> dict:
         mark(st, "T4", "ok", "%d 只已打标签" % len(rows))
         save_state(st)
         r = run(capital, ledger, pipeline=True, dry=dry, resume=True)
-        # pipeline 只跑到 T7（计划生成）；评分（T8）改到月报做，决策日不再评分。
+        # pipeline 只跑到 T7（计划生成）；评分（T8）改到年报做（月报只取数字、不判档），决策日不再评分。
         # 所以下一步指 T9：先 weekly 落 nav、review 验收，再 --stage T9 写计划书。
         return {"ok": not r["aborted"], "sid": "T4", "next": "T9",
                 "log": r["log"],
                 "hint": "先跑 run.py --only-plan → weekly.py --ledger %s --reuse → "
                         "review.py，再 team.py --stage T9 --ledger %s 写计划书"
-                        "（评分在月报，决策日不出评分）" % (ledger, ledger),
+                        "（评分在年报，决策日不出评分）" % (ledger, ledger),
                 "reason": "" if not r["aborted"] else "下游引擎失败（见 log）"}
 
     # ---- T3：深取产物齐全性
@@ -750,7 +751,7 @@ def _basket_ladder() -> str:
     """把 config 的「权益比例 → 篮子只数」映射写成任务书里的一句人话（阈值只读 config）。"""
     rows = list(config.EXEC.get("max_stock_names_by_ratio") or [])
     if not rows:
-        return "按档位 4–6 只"
+        return "按档位 3–5 只"
     return "、".join(f"权益 ≤{float(cap):.0%} → {int(n)} 只" for cap, n in rows)
 
 
@@ -760,8 +761,8 @@ def _t2_background() -> str:
     为什么给研究层看这两样：
       1) 事件面原来只进脚本新闻闸和 T3 深取，T2 第一轮「判事件风险」实际没有输入，
          等于凭快照字段猜事件；这里把候选相关的事件摘要直接摆出来。
-      2) 牛熊档位决定权益上限和篮子只数（4/5/6），研究层不知道档位就会拿
-         「反正只买 4 只」当理由多剔；但档位只作背景，**不许据此改权限、加池外票**。
+      2) 牛熊档位决定权益上限和篮子只数（3/4/5），研究层不知道档位就会拿
+         「反正只买 3–5 只」当理由多剔；但档位只作背景，**不许据此改权限、加池外票**。
     两样产物缺失时如实写「未生成」，不阻断任务书生成（fail-soft）。
     """
     lines = ["## 背景（只作判断依据，不改你的权限）", ""]
@@ -783,7 +784,7 @@ def _t2_background() -> str:
         lines.append("    - 熊/深熊：同样的利空更可能是永久损失（估值下杀 + 流动性收缩），"
                      "风险类证据按更重看待；但 reject 必须点名具体事实（公告/预告/财务/估值分位），"
                      "**不许只写「因为熊市」**。")
-        lines.append("    - 牛：不许因为「牛市」忽略风险或放宽条件；牛市里篮子更宽（5–6 只），"
+        lines.append("    - 牛：不许因为「牛市」忽略风险或放宽条件；牛市里篮子更宽（5 只，半仓 4 只），"
                      "你的任务是别把好票错剔。")
         lines.append("    - 普通：按事实判断，不因档位加减分。")
         lines.append("  - （regime.json 生成于 %s；若不是今天，先跑第 4 步刷新）"
@@ -905,7 +906,7 @@ def patrol_summary() -> dict:
 def product_ref_date(today: _dt.date | None = None) -> _dt.date:
     """产物的「参考日」：优先 stage3_plan.json 的 data_as_of，缺失/坏了才用今天。
 
-    为什么不能直接拿「今天」判新鲜度：决策日固定周六 20:00，行情数据是工作日 19:00
+    为什么不能直接拿「今天」判新鲜度：决策日固定周三、周六 20:30，行情数据是工作日 19:00
     取的最后交易日（周五）的——stage1_candidates/stage2_judged 天然是周五生成，
     用「mtime == 今天」会把它们误判成过期、fail-closed 掉整条 T5–T7（2026-11-21 实测）。
     正确口径：产物只要不早于本次决策所用的数据日（data_as_of）就是新鲜的；
@@ -1166,7 +1167,7 @@ def run(capital: float, ledger: str, pipeline: bool = False,
     # 本次花费由下一次决策会话第 2 步 `billing.py --task-end` 统一补记。
     _ = billing  # 保留模块引用（T8 里还会用到）
 
-    # ---- T8 专用路径（月报：月度复盘员/Lead 在月底跑；决策日不再评分）
+    # ---- T8 专用路径（年报：1/1 定档；月报只取记分卡数字、不判档；决策日不再评分）
     # 不重复体检、不重算计划：这两步当天已经跑过，重跑会覆盖 out/ 产物且把 nav 又推回上一期。
     if t8:
         info = do_t8(st, capital, ledger, dry=dry)
@@ -1176,7 +1177,7 @@ def run(capital: float, ledger: str, pipeline: bool = False,
                          token_cost=info["token_cost"], cost_src=info["cost_src"],
                          run_cost=info.get("run_cost"))
         else:
-            log.append("T9 骨架跳过（--score-only：月报只取记分卡，不覆盖本期计划书）")
+            log.append("T9 骨架跳过（--score-only：只取记分卡数字，不覆盖本期计划书）")
         if monthly:
             mark(st, "T10", "pending", "月度复盘任务文件已生成")
         st["ended_ms"] = int(_dt.datetime.now().timestamp() * 1000)
@@ -1233,11 +1234,11 @@ def run(capital: float, ledger: str, pipeline: bool = False,
 
     # ---- T8 计分（月报）
     # 2026-11-07 B 类 #5 + 2026-11-21 用户拍板：一周看不出能力，评分改到月报做。
-    # pipeline 不碰 T8；月报里单独 `team.py --run-t8 --score-only`（只出记分卡、不覆盖计划书）。
+    # pipeline 不碰 T8；月报/年报里单独 `team.py --run-t8 --score-only`（只出数字/记分卡、不覆盖计划书；`--annual` 才定档）。
     # dry-run 仍出记分卡骨架（0 计费），方便编排自测。
     info = do_t8(st, capital, ledger, dry=True) if dry else None
     if not info:
-        log.append("T8/T9 跳过：pipeline 不自动评分；评分在月报（team.py --run-t8 --score-only）")
+        log.append("T8/T9 跳过：pipeline 不自动评分；评分在年报（team.py --run-t8 --score-only --annual）")
         if monthly:
             mark(st, "T10", "pending", "月度复盘任务文件已生成")
         st["ended_ms"] = int(_dt.datetime.now().timestamp() * 1000)
@@ -1257,7 +1258,44 @@ def run(capital: float, ledger: str, pipeline: bool = False,
 
 
 
-def do_t8(st: dict, capital: float, ledger: str, dry: bool = False) -> dict:
+_ANNUAL = False   # --annual：年报模式（档位/奖励只在年报出；月报只取数字）
+
+
+def _grade_period() -> str:
+    return str((config.PERF or {}).get("grade_period") or "")
+
+
+def _show_grade(annual=None) -> bool:
+    """是否在本次记分卡里出档位/奖励（2026-11-26 用户拍板：计分放年报）。"""
+    if annual is None:
+        annual = _ANNUAL
+    return bool(annual) if _grade_period() == "annual" else True
+
+
+def _grade_block(ev, annual=None) -> str:
+    txt = score.format_report(ev)
+    _note = str(ev.get("annual_note") or "").strip()
+    # grade_note：例如 out/budget.json 缺失导致 token 实花按 0、档位被封顶 B- —— 必须解释，
+    # 否则读者只看到一个降档（测试审计 A-2）。
+    _gnote = str(ev.get("grade_note") or "").strip()
+    if _show_grade(annual):
+        body = txt
+    else:
+        out = []
+        for ln in txt.splitlines():
+            if " → 评分" in ln:
+                out.append(ln.split(" → 评分")[0] + "｜档位 —（年度评分：每年 1 月 1 日年报定档）")
+            elif ln.startswith("奖励："):
+                out.append("奖励：—（随年度结算评定，档位只在年报出）")
+            else:
+                out.append(ln)
+        body = "\n".join(out)
+    _tails = [t for t in (_note, (f"⚠ {_gnote}" if _gnote else "")) if t]
+    return body + ("\n" + "\n".join(_tails) if _tails else "")
+
+
+def do_t8(st: dict, capital: float, ledger: str, dry: bool = False,
+          annual=None) -> dict:
     """T8 计分结算（只读账本；周期结算模式不在此分段），返回 {log, ev, ret, token_cost, cost_src}。
 
     为什么独立成函数（2026-11-07 B 类 #5）：`run()` 里的 pipeline 在 weekly.py **之前**
@@ -1268,12 +1306,21 @@ def do_t8(st: dict, capital: float, ledger: str, dry: bool = False) -> dict:
     只读：不改账本、不下单；写 `out/scorecard.md` 与 `out/team/state.json` 的 billing 段。
     """
     log: list[str] = []
+    # A6：动态本金下配置里的 50,000 会过期，本金默认取账本「累计投入」。
+    try:
+        import capital_dyn as _cd0
+        import paper as _paper0
+        _sp0 = ((config.PAPER.get("ledgers") or {}).get(ledger) or {}).get("state_file")
+        if _sp0 and os.path.isfile(_sp0):
+            capital = float(_cd0.contributed_capital(_paper0.load(_sp0))) or capital
+    except Exception:  # noqa: BLE001 — 读不到就沿用命令行本金
+        pass
     # 周期结算模式：不做窗口旁证（旧的 sum_window 已删）；窗口字段只为记分卡兼容留空。
     win = {"since": "", "until": "", "n_calls": 0, "tokens": 0, "cost_cny": 0.0}
-    # 周期结算模式下没有任务窗口：T8 不结算（成本留到下一次决策第 2 步 --task-end 按周期记账）
+    # 周期结算模式下没有任务窗口：T8 不在此分段结算，成本由下一次决策第 2 步 --cycle-end 按周期累计
     settle = (billing.task_settle(note=f"team.py T8 分段结算（{ledger}）")
               if (not dry and billing.task_open())
-              else {"ok": False, "reason": "周期结算模式：不在此分段"})
+              else {"ok": False, "reason": "无任务窗口（周期结算模式）：T8 不分段结算，成本走周期累计"})
     run_cost = float(settle.get("cost_cny") or 0.0) if settle.get("ok") else 0.0
 
     # 评分口径（User 2026-11-07）：净利润 = 账户累计收益 − token 实花；
@@ -1290,7 +1337,31 @@ def do_t8(st: dict, capital: float, ledger: str, dry: bool = False) -> dict:
         note = "无账本净值，收益按 0 计（新账本未开始交易）"
     else:
         note = ""
-    ev = score.evaluate(ret, token_cost, capital, mdd)
+    _annual_rate = None
+    _annual_note = ""
+    if _show_grade(annual):
+        # 动态本金（2026-11-26）：年报档位 = **本年**各月等价年化率的算术平均。
+        # 先用净值现算一次最后一个月的等价年化（= 先记录上月），再取本年所有已运行月份的平均。
+        try:
+            import capital_dyn as _cd
+            _sp = ((config.PAPER.get("ledgers") or {}).get(ledger) or {}).get("state_file")
+            if _sp and os.path.isfile(_sp):
+                _st_led = paper.load(_sp)
+                _gy = _cd.grade_year(_st_led)
+                if _gy:
+                    _yr = _cd.year_mean_equiv(_st_led, _gy)
+                    _annual_rate = _yr.get("value")
+                    _miss = "、".join(_yr.get("missing") or [])
+                    _annual_note = (f"年化口径：{_gy} 年 {_yr.get('months')} 个月等价年化算术平均"
+                                    + (f"（样本不足未计入：{_miss}）" if _miss else ""))
+                    if int(_yr.get("months") or 0) < 3:
+                        _annual_note += "（样本 <3 个月，档位只作参考）"
+        except Exception:  # noqa: BLE001 — 读不到就退回整段年化，不阻塞记分卡
+            _annual_rate = None
+            _annual_note = ""
+    ev = score.evaluate(ret, token_cost, capital, mdd, annual_rate_override=_annual_rate)
+    if _annual_note:
+        ev["annual_note"] = _annual_note
     if not budget_ok and not dry:
         _order = list(getattr(score, "_GRADE_ORDER", ["A", "B+", "B", "B-", "C", "D"]))
         _cap = "B-"
@@ -1316,7 +1387,7 @@ def do_t8(st: dict, capital: float, ledger: str, dry: bool = False) -> dict:
         "",
         "## 评分（净收益率口径）",
         "```",
-        score.format_report(ev),
+        _grade_block(ev, annual),
         "```",
         "",
         "## 12 期分布目标",
@@ -1325,13 +1396,13 @@ def do_t8(st: dict, capital: float, ledger: str, dry: bool = False) -> dict:
         "## 诚实边界",
         "- 净利润 = 账户累计收益 − token 实花；token 实花取 out/budget.json 该账本累计 spent，不是计提。",
         "- 任务窗口记的是「本次任务花了多少」，只作对账；评分用累计实花，避免每期重复扣。",
-        "- 奖励评估期：2027-10-30 起评判；在此之前 reward 一律 0（档位照常给）。",
+        "- 奖励评估期：2027-10-30 起评判；在此之前 reward 一律 0。**档位/奖励只在年报（1 月 1 日）出**（`--annual`），月报只出数字。",
         "- 结算时点：T8 只在 weekly.py 落完当日 nav 之后跑；pipeline 阶段不再评分（否则净收益恒 0）。",
     ]
     _write(os.path.join(config.OUT_DIR, "scorecard.md"), "\n".join(card) + "\n")
-    mark(st, "T8", "ok", f"净收益 {ev['net_rate']:.2%} 评分 {ev['grade']}")
+    mark(st, "T8", "ok", f"净收益 {ev['net_rate']:.2%} " + (f"评分 {ev['grade']}" if _show_grade(annual) else "档位待年报"))
     log.append(f"T8 ✓ 记分卡：账户收益 {ret:.2%}｜token 实花 {token_cost:.4f} 元｜"
-               f"净收益 {ev['net_rate']:.2%} → {ev['grade']}"
+               f"净收益 {ev['net_rate']:.2%} → " + (f"{ev['grade']}" if _show_grade(annual) else "档位待年报（--annual 才出）")
                + ("（奖励：评估期未到）" if ev.get("reward_pending") else ""))
     return {"log": log, "ev": ev, "ret": ret, "token_cost": token_cost,
             "cost_src": cost_src, "note": note, "run_cost": run_cost}
@@ -1353,7 +1424,8 @@ def status() -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description="决策/月报编排（Lead + fresh 子代理 + 规则引擎，T0–T10）")
-    ap.add_argument("--capital", type=float, default=50000.0)
+    ap.add_argument("--capital", type=float, default=0.0,
+                    help="本金；不传（0）= 按账本累计投入自动（动态本金逐月变大）")
     ap.add_argument("--ledger", default="50k", choices=sorted(config.PAPER["ledgers"].keys()))
     ap.add_argument("--dry-run", action="store_true", help="只走编排与产物，不调用管线、不写账")
     ap.add_argument("--run", action="store_true", help="真实运行")
@@ -1362,6 +1434,8 @@ def main():
                     help="只跑 T8 评分（月报用；决策日不再评分）")
     ap.add_argument("--score-only", action="store_true",
                     help="配合 --run-t8：只出记分卡，不生成/覆盖 T9 计划书骨架（月报默认）")
+    ap.add_argument("--annual", action="store_true",
+                    help="年报模式：记分卡出档位/奖励（默认按 config.PERF.grade_period=annual → 月报不出档位）")
     ap.add_argument("--monthly", action="store_true", help="生成 T10 复盘任务")
     ap.add_argument("--stage", metavar="T2|T3|T4|T8|T9",
                     help="生成某一步的任务书（Lead 拿去派给执行者：subagent/队友）")
@@ -1372,12 +1446,21 @@ def main():
     ap.add_argument("--budget", action="store_true", help="打印预算分配")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
+    global _ANNUAL
+    _ANNUAL = bool(a.annual)
 
     if a.contract:
         for c in handoff_contract():
             print(f"{c['name']:<12} {c['path']:<28} {_who(c['producer'])}")
             print(f"             列: {c['cols']}")
         return 0
+
+    if not a.capital:  # A6：不传 = 按账本累计投入自动（动态本金逐月变大）
+        try:
+            import capital_dyn as _cd_auto
+            a.capital = _cd_auto.live_capital(a.ledger or "50k")
+        except Exception:  # noqa: BLE001
+            a.capital = 50000.0
 
     if a.budget:
         for b in budget_plan(a.capital, a.ledger):

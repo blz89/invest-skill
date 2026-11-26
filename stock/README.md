@@ -4,7 +4,7 @@
 统一缓存、统一错误处理、统一列名。新写的脚本都放进来，不再到处复制粘贴。
 
 ```
-<本技能目录>\stock\
+D:\skills\invest\stock\
   .venv\              ← 本机解释器（Python 3.13 + pandas/requests/py_mini_racer；gitignored，不入库）
   stock\              ← 包（import stock）
     config.py         ← 路径/缓存/限流/UA，全部可环境变量覆盖
@@ -51,28 +51,28 @@
 ## 快速开始
 
 ```powershell
-# 1) 让 Python 找到包（包根是 <本技能目录>\stock，包名是 stock）
-$env:PYTHONPATH = "<本技能目录>\stock"
+# 1) 让 Python 找到包（包根是 D:\skills\invest\stock，包名是 stock）
+$env:PYTHONPATH = "D:\skills\invest\stock"
 
 # 2) 自检（不联网）：看源可用性、缓存状态
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock doctor
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock doctor
 
 # 3) 常用
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock daily 600519 -n 5
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock index 000300 -n 5
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock etf 510300 -n 5
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock quote 600519 000300.SH 510300
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock fund 004985 -n 5
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock money --top 10
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock repo 204001 -n 5
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock cache            # 统计
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock cache --clear    # 清空
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock daily 600519 -n 5
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock index 000300 -n 5
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock etf 510300 -n 5
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock quote 600519 000300.SH 510300
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock fund 004985 -n 5
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock money --top 10
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock repo 204001 -n 5
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock cache            # 统计
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock cache --clear    # 清空
 ```
 
 代码里：
 
 ```python
-import sys; sys.path.insert(0, r"<本技能目录>\stock")
+import sys; sys.path.insert(0, r"D:\skills\invest\stock")
 from stock import api
 
 df = api.daily("600519", start="2026-10-01")        # date/open/close/high/low/volume
@@ -120,7 +120,7 @@ ep.tool_trade_date_hist_sina()     # 交易日历
 → `ep.fund_scale_em(代码)`（东财 fundmobapi，兜底，债券/货币基金也覆盖）；数据层
   `ds.fetch_fund_scale()` 自动逐级回退，`fund_scale_source()` 告诉你实际用的哪个源。
 - **改取数逻辑**：直接改 `endpoints/` 对应分组。
-- **验证**：`python <本技能目录>\stock\tools\smoke.py`（联网）；`python -m unittest discover -s stock\tests`（离线）。
+- **验证**：`python D:\skills\invest\stock\tools\smoke.py`（联网）；`python -m unittest discover -s stock\tests`（离线）。
 - **兜底与域名冷却**：ETF 快照主源（东财 push2）失败 → 新浪 ETF 列表（927 只，成交量「份」÷100 转「手」）；
   ETF 历史失败 → 腾讯 K 线（支持 qfq/hfq、日/周/月）→ 新浪 ETF 日线（不复权，周/月用 `W-FRI`/`ME` 重采样）。
   失败过的东财域名进 10 分钟冷却表（`_HOST_DOWN`），冷却期内直接跳过：首调约 10–12 秒，之后 0.4 秒。
@@ -144,13 +144,13 @@ _skilldata.install("invest", _sys.modules[__name__])
 - **改取数逻辑 → 改 stock**，改完两个技能同时生效；技能侧只留策略口径（例：行业归一表走
   `datasource.set_market_hook()`，不塞进 stock）。
 - **改技能 config 里的数据口径**（缓存目录、TTL、可选属性）仍在技能 `config.py` 里，`install()` 实时读取。
-- 运行数据在 `<本技能目录>\stock\data\invest`（技能 config 的 `WORK_DIR` 默认值，见下节），
+- 运行数据在 `D:\skills\invest\stock\data\invest`（技能 config 的 `WORK_DIR` 默认值，见下节），
   但两边的 `cache\` 是同一份（junction → `data\shared\cache`），**取数只取一次**。
 
 ## 同花顺 key
 
 按顺序找：环境变量 `HITHINK_FINANCE_API_KEY` / `FUYAO_API_KEY` →
-`%APPDATA%\hithink-finance\credentials.env` → `<本技能目录>\stock\data\fuyao.key`。
+`%APPDATA%\hithink-finance\credentials.env` → `D:\skills\invest\stock\data\fuyao.key`。
 `python -m stock doctor` 里的 `fuyao.key_source` 会告诉你 key 从哪来（只报来源，不打印值）。
 
 ## 约定
@@ -161,17 +161,17 @@ _skilldata.install("invest", _sys.modules[__name__])
 4. 缓存默认 1 天；`STOCK_REFRESH=1` 强制刷新；`STOCK_HOME` 可把整个工作目录挪走。
 5. 依赖：`pandas`（硬）、`requests`、`py_mini_racer`（新浪日线解密）、`beautifulsoup4`/`lxml`（表格解析）、
    `openpyxl`/`xlrd`（Excel 解析）、`pyarrow`（可选，有则 parquet）。
-6. 新脚本（策略、回测、报表）建议放 `<本技能目录>\stock\scripts\`，只 `import stock`，别再复制取数实现。
+6. 新脚本（策略、回测、报表）建议放 `D:\skills\invest\stock\scripts\`，只 `import stock`，别再复制取数实现。
 
 ## 测试
 
 ```powershell
 # 离线（改完代码必跑）
-<本技能目录>\stock\.venv\Scripts\python.exe -m unittest discover -s <本技能目录>\stock\stock\tests -p "test_*.py" -v
+D:\skills\invest\stock\.venv\Scripts\python.exe -m unittest discover -s D:\skills\invest\stock\stock\tests -p "test_*.py" -v
 # test_endpoints.py 专门验证「49 个接口齐全、分组齐全、不直接依赖 HTTP 库」
 
 # 联网冒烟（每个源打一发，约 1 分钟）
-$env:STOCK_LIVE="1"; <本技能目录>\stock\.venv\Scripts\python.exe -m unittest discover -s <本技能目录>\stock\stock\tests -p "test_live.py" -v
+$env:STOCK_LIVE="1"; D:\skills\invest\stock\.venv\Scripts\python.exe -m unittest discover -s D:\skills\invest\stock\stock\tests -p "test_live.py" -v
 ```
 
 ## 统一取数（`stock prefetch`，一条命令）
@@ -182,11 +182,11 @@ $env:STOCK_LIVE="1"; <本技能目录>\stock\.venv\Scripts\python.exe -m unittes
 并写一份「今晚取了什么、覆盖是否完整」的记录：
 
 ```powershell
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock prefetch            # 全量（默认 8 线程，约 10-15 分钟）
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock prefetch --dry-run  # 只打印计划
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock prefetch --verify-only   # 只做覆盖自检
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock prefetch --skip-stocks   # 演练/救急：跳过个股逐只预热
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock prefetch --with-weekly   # 附带货基历史（慢，决策日用）
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock prefetch            # 全量（默认 8 线程，约 10-15 分钟）
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock prefetch --dry-run  # 只打印计划
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock prefetch --verify-only   # 只做覆盖自检
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock prefetch --skip-stocks   # 演练/救急：跳过个股逐只预热
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock prefetch --with-weekly   # 附带货基历史（慢，决策日用）
 ```
 
 - 覆盖：参考快照（交易日历/板块/指数/ETF 全表/申购表/当日净值/货基排行/利率）、
@@ -203,13 +203,13 @@ $env:STOCK_LIVE="1"; <本技能目录>\stock\.venv\Scripts\python.exe -m unittes
   不足 → 退出码 2，整体异常 → 1，OK → 0；**盘中/凌晨 15:05 前写当天键 → 退出码 3**（用 --date 回放或
   --allow-intraday 仅演练放行）。
 - 数据日 = 真实今天（与两技能默认一致）；`--date` 可钉住（演练回放），`--force` 忽略当日缓存重取。
-- 启动时清掉共享缓存里当天的 `*.failed` 负缓存标记——一次失败不该毒死当晚全链。`n- 所有写盘都是原子写（tmp+`os.replace`）：prefetch 内部三组并发、20:00 会话只读，不会读到半截 CSV/JSON。
+- 启动时清掉共享缓存里当天的 `*.failed` 负缓存标记——一次失败不该毒死当晚全链。- 所有写盘都是原子写（tmp+`os.replace`）：prefetch 内部三组并发、20:00 会话只读，不会读到半截 CSV/JSON。
 
 ## 每日巡检与记录（交易日 19:00）
 
 计划任务 **`DSH-DailyPatrol`**：周一至周五 **19:00**（`StartWhenAvailable` 开机补跑，
 给冷启动 ~16 分钟的 prefetch 留出到 20:00 会话的余量），
-调用 `<本技能目录>\stock\scripts\daily_patrol.ps1 -Ledger 50k`，用 `<本技能目录>\stock\.venv\Scripts\python.exe` 串行跑四步
+调用 `D:\skills\invest\stock\scripts\daily_patrol.ps1 -Ledger 50k`，用 `D:\skills\invest\stock\.venv\Scripts\python.exe` 串行跑三步
 （只取数 + 记录，**不算账本**；账本由 20:00 的 DSH 巡检会话结算）：
 
 | 步骤 | 内容 |
@@ -218,7 +218,7 @@ $env:STOCK_LIVE="1"; <本技能目录>\stock\.venv\Scripts\python.exe -m unittes
 | `invest_data` | `run.py --capital 50000`（读热缓存 → 漏斗 → 计划；0 token；**不带 `--refresh`**） |
 | `prune` | `python -m stock prune --days 90`（保留期清理，删失败不影响巡检结论） |
 
-**记录全部落在 `<本技能目录>\stock\data\`，且每个文件名都带日期**：
+**记录全部落在 `D:\skills\invest\stock\data\`，且每个文件名都带日期**：
 
 | 位置 | 文件 | 内容 |
 |---|---|---|
@@ -237,8 +237,8 @@ $env:STOCK_LIVE="1"; <本技能目录>\stock\.venv\Scripts\python.exe -m unittes
 可改（同时作用于 prune 与归档清扫）。先看要删什么：
 
 ```powershell
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock prune --dry     # 只统计
-<本技能目录>\stock\.venv\Scripts\python.exe -m stock prune           # 真删（默认 90 天）
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock prune --dry     # 只统计
+D:\skills\invest\stock\.venv\Scripts\python.exe -m stock prune           # 真删（默认 90 天）
 ```
 
 `-Root <dir>` 用于演练（不碰真实数据、不执行 prune；会在演练根里自建 `shared\cache` 与两个 junction，并把 `STOCK_OUT_DIR` 也指到演练根）；
@@ -255,4 +255,4 @@ $env:STOCK_LIVE="1"; <本技能目录>\stock\.venv\Scripts\python.exe -m unittes
 - 东财快照 `f12` 可能返回数字（`300`），必须 `zfill(6)`；
 - 货基快照的 `'---'` 要转 NaN，7 日年化列名带日期前缀（取最后一组）；
 - PowerShell here-string 里写 `\"` 会 `SyntaxError`，脚本一律落 `.py` 再执行；
-- `PYTHONPATH` 要用 `<本技能目录>\stock`（不要用盘符根目录当 PYTHONPATH，否则目录名会被当成命名空间包遮住真包）。
+- `PYTHONPATH` 要用 `D:\skills\invest\stock`（不是 `D:\`，否则目录名会被当成命名空间包遮住真包）。

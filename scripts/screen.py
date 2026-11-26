@@ -64,9 +64,24 @@ def risk_warn_codes(names: pd.DataFrame) -> set:
     return set(codes[mask])
 
 
-def is_suspended(row: dict) -> bool:
-    """最近一根日线不是数据日 → 停牌或数据缺失（不通过 L1 停牌门槛）。"""
-    return str(row.get("last_bar") or "") != ds.data_date()
+def is_suspended(row: dict, data_day: str | None = None) -> bool:
+    """最近一根日线不是数据日 → 停牌或数据缺失（不通过 L1 停牌门槛）。
+
+    `data_day` 由调用方给「数据日」：主流程传的是**全池最新一根日线的日期**（市场
+    实际数据日），不是墙钟日期。凌晨/周末/节假日跑管线时 `ds.data_date()` 会指向
+    今天（当天还没有日线），若拿它比，全池会被误判停牌、静默产出 0 候选——2026-11-26
+    凌晨首次运行就踩了这个坑（漏斗 L1_no_suspend=0、进入阶段二=0，无任何报错）。
+    没传才退回 `ds.data_date()`（A_SHARE_DATA_DATE 钉住回放时以钉住值为准）。
+    """
+    expect = data_day or ds.data_date()
+    return str(row.get("last_bar") or "") != expect
+
+
+def market_data_day(rows: list) -> str:
+    """全池最新一根日线的日期（= 市场实际数据日）；一只都取不到时退回 ds.data_date()。"""
+    days = [str(r.get("last_bar") or "") for r in rows if isinstance(r, dict)]
+    days = [d for d in days if d]
+    return max(days) if days else ds.data_date()
 
 def pct_rank_in(vals: pd.Series, x: float) -> float | None:
     """x 在同行业样本里的分位。"""
@@ -170,7 +185,7 @@ def eval_one(code: str, name: str, industry: str) -> dict:
 
 
 # ---------------------------------------------------------------- 门槛判定
-def apply_gates(row: dict, ind_stats: dict) -> dict:
+def apply_gates(row: dict, ind_stats: dict, data_day: str | None = None) -> dict:
     """逐条判定，每条都留下『值』与『是否通过』，不通过的原因可追溯。"""
     s1 = config.S1_STOCK
     fin_flag = is_financial(row["name"])
@@ -180,7 +195,7 @@ def apply_gates(row: dict, ind_stats: dict) -> dict:
     g["L1_liquidity"] = (row.get("avg_amt60_yi") or 0) >= s1["min_avg_amt60_yi"]
     g["L1_history"] = (row.get("list_days") or 0) >= s1["min_list_days"]
     g["L1_not_st"] = not is_st(row["name"])
-    g["L1_no_suspend"] = not is_suspended(row)
+    g["L1_no_suspend"] = not is_suspended(row, data_day)
 
     g["L2_roe"] = row.get("roe_years_ok", 0) >= s1["roe_need_years"]
     g["L2_cash"] = (row.get("ocf_ni_3y") is not None
@@ -325,7 +340,14 @@ def main() -> int:
     print(f"\n[L2] 取数成功 {len(ok)}/{len(df)}，失败 {len(df)-len(ok)}", flush=True)
 
     # 逐条门槛判定
-    judged = [apply_gates(r, ind_stats) for r in ok.to_dict("records")]
+    # 停牌判据的「数据日」：A_SHARE_DATA_DATE 明确钉住时以钉住值为准（回放/冻结）；
+    # 否则用全池最新一根日线的日期——墙钟日期在凌晨/周末会指向「还没有日线」的今天，
+    # 那会把全池误判成停牌并静默产出 0 候选（2026-11-26 凌晨首次运行踩过）。
+    pinned = bool(os.environ.get("A_SHARE_DATA_DATE", "").strip())
+    suspend_day = None if pinned else market_data_day(ok.to_dict("records"))
+    print(f"[L1] 停牌判据数据日：{suspend_day if suspend_day is not None else ds.data_date()}"
+          f"（{'A_SHARE_DATA_DATE 钉住' if pinned else '全池最新日线'}）", flush=True)
+    judged = [apply_gates(r, ind_stats, suspend_day) for r in ok.to_dict("records")]
     for r in judged:
         apply_valuation_gate(r, snap_index, ind_stats)
     jdf = pd.DataFrame(judged)

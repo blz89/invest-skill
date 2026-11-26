@@ -18,7 +18,7 @@ baostock 的季频报表带 **pubDate（真实披露日）**——实测：
 3. `eps_ttm(code, asof)` + `pe_ttm`    当时可见的 TTM 每股收益 → 算 TTM 市盈率
 4. `index_members(index, date)` / `trade_days(start, end)`  历史成分、交易日历
 
-依赖：baostock（已装在 <本技能目录>\stock\.venv）。未安装时 `available()` 为 False，所有函数返回
+依赖：baostock（已装在 D:\skills\invest\stock\.venv）。未安装时 `available()` 为 False，所有函数返回
 None/空表并抛 PitError —— **不影响既有链路**。
 
 用法：

@@ -11,7 +11,7 @@
 
 每一步的输出都落在 out/ 目录，可以单独重跑而不用从头开始（有缓存）。
 
-本部署分工：**基础数据由交易日 19:00 的 Windows 任务 `python -m stock prefetch` 统一取满**（0 token，两技能共用热缓存）；本脚本默认只读热缓存跑三阶段（`run.py --capital 50000`，**不带 --refresh**）；**周六 20:00 决策日不取数**——`--refresh` 只用于工作日手工补数/调试。
+本部署分工：**基础数据由交易日 19:00 的 Windows 任务 `python -m stock prefetch` 统一取满**（0 token，两技能共用热缓存）；本脚本默认只读热缓存跑三阶段（`run.py --capital 50000`，**不带 --refresh**）；**周三/周六 20:30 决策日不取数**——`--refresh` 只用于工作日手工补数/调试。
 """
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def apply_refresh(args) -> None:
 def main():
     ap = argparse.ArgumentParser(description="三阶段投资策略一键运行（本部署本金 5 万）")
     ap.add_argument("--limit", type=int, default=None, help="阶段一只筛前 N 只")
-    ap.add_argument("--capital", type=float, default=50000.0,
+    ap.add_argument("--capital", type=float, default=0.0,
                     help=f"可用本金，必须在 {config.CAPITAL['min']:,.0f}–"
                          f"{config.CAPITAL['max']:,.0f} 元之间")
     ap.add_argument("--tier", default=config.CAPITAL["default_tier"],
@@ -88,6 +88,12 @@ def main():
     apply_refresh(args)
 
     try:
+        if not args.capital:  # A6：不传 = 按账本累计投入自动
+            try:
+                import capital_dyn as _cd_auto
+                args.capital = _cd_auto.live_capital()
+            except Exception:  # noqa: BLE001
+                args.capital = 50000.0
         capital = cap.validate_capital(args.capital)
     except cap.CapitalRangeError as e:
         print(f"✗ {e}", file=sys.stderr)

@@ -99,6 +99,12 @@ def _check_pool_accrual():
               "池子利息按逐日万份收益入账（basis=万份收益逐日）")
         check(abs(float(got) - 1.2227) < 0.05,
               f"池子万份收益 0.70 + 朝朝宝 0.52 ≈ 1.22 元（实际 {got}）")
+        _cy = [e for e in st.get("events", []) if e.get("level") == "cash_yield"]
+        _msg = str(_cy[-1].get("msg")) if _cy else ""
+        check("按逐日万份收益实得" in _msg and "按逐日利率实得" in _msg,
+              "计息文案写实得金额/实得年化（真实口径，不写标签利率）")
+        check("只用于选基、不是计息利率" in _msg,
+              "计息文案标明 90 天口径只用于选基")
         check(any("货基池持仓更新" in str(e.get("msg")) for e in st.get("events", [])),
               "首次计息记录货基池持仓快照")
         check(paper.accrue_cash_lots(st, "2026-11-20", ["2026-11-20"]) == 0.0,
@@ -243,7 +249,9 @@ def _check_chain_accounting():
     st["meta"]["capital"] = 50000.0
     st["meta"]["cum_index"] = 1.1
     p = paper.portfolio(st, {})
-    check(abs(p["total_return"] - 0.21) < 1e-9, "总收益 = cum_index × nav / 本金 − 1")
+    # A3：分母已是「累计投入」（初始本金 + Σ注资），cum_index 再乘一次会把历史收益放大一遍。
+    check(abs(p["total_return"] - 0.10) < 1e-9,
+          "总收益 = (nav + 已划出奖励) / 累计投入 − 1（不再乘 cum_index）")
     st["trades"] = [{"action": "sell", "realized_pnl": 1000.0}]
     st["repo_history"] = [{"interest": 100.0, "fee": 0.0}]
     st["meta"]["annual_baseline"] = {"realized": 1000.0, "cash_interest": 100.0}
@@ -255,7 +263,7 @@ def _check_chain_accounting():
           "基线之后的新增盈利才计入可投资本")
 
 
-def main():
+def main(summary: bool = True):
     print("=== 1. 生效日之前不成交 ===")
     st = fresh()
     buy_etf(st, shares=200, price=4.0, eff="2026-10-26")
@@ -579,7 +587,7 @@ def main():
     check(plan_lk["repo_locked"] == 2000.0 and plan_lk["money_fund"] == 7800.0,
           f"在途逆回购本金不重复计朝朝宝息（锁定 {plan_lk.get('repo_locked')} / "
           f"朝朝宝 {plan_lk['money_fund']}）")
-    # 建仓弹药不进 90 天货基池（周六决策、周一要能买）
+    # 建仓弹药不进 90 天货基池（周三/周六决策、次一交易日要能买）
     st_am = fresh()
     st_am["cash"] = 10000.0
     st_am["holdings"]["sh510300"] = {"code": "sh510300", "name": "沪深300ETF", "kind": "etf",
@@ -673,6 +681,9 @@ def main():
           f"利息记进现金（现金 {st_y2['cash']}）")
     check(any(e["level"] == "cash_yield" for e in st_y2["events"]),
           "计息写 cash_yield 事件（可追溯）")
+    _cy2 = [e for e in st_y2["events"] if e.get("level") == "cash_yield"]
+    check(bool(_cy2) and str(_cy2[-1].get("msg", "")).startswith("（回滚口径"),
+          "回滚口径计息文案显式标注（年化×天数，仅离线/测试）")
     _split = paper.cash_interest_split(st_y2)
     check(_split["booked"] == expect and _split["pending"] == 0.0
           and _split["total"] == expect,
@@ -901,7 +912,7 @@ def main():
     check(len(sch) == 1, f"每周只有周一一个操作日，实际 {len(sch)} 笔")
     check(sch[0]["buy"] == "2026-10-19" and sch[0]["term"] == 7
           and sch[0]["mature"] == "2026-10-26",
-          "周一买 7 天期（R-007），下周一到期")
+          "周一买 7 天期（R-007），次一交易日到期")
     check(not [x for x in sch if x["buy"] != "2026-10-19"], "非周一不产生 lot")
     sch2 = paper.repo_lot_schedule(CAL, "2026-10-15", "2026-10-23", term_days=28)
     check(bool(sch2) and sch2[0]["term"] == 28, "term_days=28 时按金额分档锁 28 天期")
@@ -919,7 +930,7 @@ def main():
           f"7,800 元观望资金 → 7 天期（实际 {_p0['repo_term_days']}）")
     w1 = paper.accrue_cash_lots(st, "2026-10-23", CAL)
     check(st.get("repo_open") and st["repo_open"]["buy"] == "2026-10-19",
-          "窗口最后一笔记为在途（周一买、下周一到期）")
+          "窗口最后一笔记为在途（周一买、次一交易日到期）")
     check(not [h for h in st.get("repo_history", []) if h.get("mature") == "2026-10-26"],
           "在途 lot 还没进已实现历史（不重复计息）")
     paper.accrue_cash_lots(st, "2026-10-24", CAL)
@@ -1289,18 +1300,19 @@ def main():
     _ex17c = paper.risk_exit_orders(_st17, {"002648"}, "2026-11-20")
     check(_ex17c == [], "风险清仓：不在名单里的持仓不动")
 
-    print()
-    if FAIL:
-        print(f"XX 失败 {FAIL} 项 / 通过 {PASS} 项")
-        return 1
-    print(f"OK 全部通过（{PASS} 项断言）")
-    return 0
+    if summary:
+        print()
+        if FAIL:
+            print(f"XX 失败 {FAIL} 项 / 通过 {PASS} 项")
+            return 1
+        print(f"OK 全部通过（{PASS} 项断言）")
+    return 1 if FAIL else 0
 
 
 if __name__ == "__main__":
     _check_daily_accrual()
     with _legacy_repo7():
-        _rc = main()
+        _rc = main(summary=False)
     if _rc == 0:
         _check_pool_default()
         _check_pool_accrual()

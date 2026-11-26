@@ -97,25 +97,48 @@ def report_path(ledger, as_of, kind="report"):
 
 
 def next_decision_day(as_of):
-    """as_of 之后最近的决策日（**每周六**，2026-10-31 起周三已取消），返回 (日期, 说明)。"""
+    """as_of 之后最近的决策日（**每周三、周六** 20:30，返回 (日期, 说明)）。"""
     try:
         d = datetime.date.fromisoformat(str(as_of))
     except Exception:
         return None, ""
     for i in range(1, 8):
         n = d + datetime.timedelta(days=i)
-        if n.weekday() == 5:
-            return n.isoformat(), "周六"
+        if n.weekday() in (2, 5):
+            return n.isoformat(), ("周三" if n.weekday() == 2 else "周六")
     return None, ""
 
 
+_CAL_CACHE = None
+
+
+def _trade_calendar():
+    """交易日历（ISO 字符串升序）；取不到返回 None（调用方退化为只跳周末）。"""
+    global _CAL_CACHE
+    if _CAL_CACHE is None:
+        try:
+            import datasource as _ds
+            df = _ds.fetch_trade_calendar()
+            _CAL_CACHE = sorted(str(x)[:10] for x in df["trade_date"].tolist())
+        except Exception:                        # noqa: BLE001 - 日历缺失退回近似
+            _CAL_CACHE = []
+    return _CAL_CACHE or None
+
+
 def next_fill_day(decision_day):
-    """决策日之后第一个交易日（近似：跳过周末；长假以交易日历为准）。"""
+    """决策日之后第一个交易日（优先交易日历；取不到日历时退化为只跳周末）。"""
     try:
         d = datetime.date.fromisoformat(str(decision_day))
     except Exception:
         return None
-    for i in range(1, 6):
+    key = d.isoformat()
+    cal = _trade_calendar()
+    if cal:
+        for x in cal:
+            if x > key:
+                return x
+        return None
+    for i in range(1, 15):
         n = d + datetime.timedelta(days=i)
         if n.weekday() < 5:
             return n.isoformat()
@@ -345,7 +368,7 @@ def _section_analysis(funnel, judged, plan=None):
 )
         note = (
             "买入线 <b>70 分</b>是绝对门槛（不看排名）；组合里的个股按<b>总分排名</b>"
-            "取前 N 只（4–6 只，随权益档位：≤35% 4 只、≤60% 5 只、>60% 6 只；权重系数 1.0/0.85/0.70/0.55，第 5/6 名沿用 0.55），单票仍受本金 10% 上限约束。"
+            "取前 N 只（3–5 只，随权益档位：≤35% 3 只、≤60% 4 只、>60% 5 只；权重系数 1.0/0.85/0.70/0.55，第 4/5 名沿用 0.55），单票仍受本金 10% 上限约束。"
             "同一份数据下排名完全稳定——连续几周看到同一只排第一，是评分粘性"
             "（基本面与估值分位变化慢），不是系统卡住；数据是否更新看报告头部的数据日期。"
 )
@@ -537,7 +560,7 @@ def _section_orders(orders, fill_note, mode):
 )
     note = fill_note or (
         f"成交口径 `PAPER.fill_price={CFG.get('fill_price')}`："
-        "决策每周六 20:00 一次（数据用交易日 19:00 本机统一取数的收盘）→ 下周一挂限价单/开盘卖出。"
+        "决策每周三、周六 20:30 各一次（数据用交易日 19:00 本机统一取数的收盘）→ 次一交易日挂限价单/开盘卖出。"
         "**买入一律限价条件单**：开盘不高于限价按开盘价成交、否则盘中触及限价按限价成交，"
         "未触及则挂到失效日；**卖出**（减仓/清仓）按次一交易日开盘价，止损单盘中触价即卖。"
         "本报告里的价格是**决策日参考价**，不等于成交价。"
@@ -559,7 +582,7 @@ def _section_future(plan, targets, state, as_of, decision_day="", skip_next=Fals
         fd = next_fill_day(nd)
         out.append(
             "<div class='card'>"
-            f"<b>下一决策日：{_esc(nd)}（{_esc(nd_name)} 20:00）</b>"
+            f"<b>下一决策日：{_esc(nd)}（{_esc(nd_name)} 20:30）</b>"
             f"{'，' + _esc(fd) + ' 起卖出按开盘价、买入按限价条件单' if fd else ''}。"
             "决策日会先体检（doctor）并核对工作日已取数据（决策日不取数），NO-GO 就停下，不会带着脏数据下单。</div>"
 )
@@ -622,7 +645,7 @@ def _section_future_brief(plan, targets, state, as_of, decision_day=""):
     out = []
     if nd:
         out.append(
-            f"<div class='note'><b>下一决策日：{_esc(nd)}（{_esc(nd_name)} 20:00）</b>"
+            f"<div class='note'><b>下一决策日：{_esc(nd)}（{_esc(nd_name)} 20:30）</b>"
             + (f"，{_esc(fd)} 起卖出按开盘价、买入按限价条件单。" if fd else "。")
             + "</div>")
     hold = state.get("holdings") or {}
@@ -883,7 +906,7 @@ def _section_breakdown(state) -> str:
 
 
 def _section_netprofit(net) -> str:
-    """净利润口径：账户收益 − token 实花。评分/档位/奖励只在月报出，周报不显示（2026-11-22 定）。"""
+    """净利润口径：账户收益 − token 实花。评分/档位/奖励只在年报出，周报不显示（2026-11-22 定，2026-11-26 计分时点改年报）。"""
     if not net:
         return ""
     return (
@@ -892,7 +915,7 @@ def _section_netprofit(net) -> str:
         f"净利润 <b>{_money(net.get('net'))}</b> 元；"
         f"净收益率 <b>{_pct(net.get('rate'))}</b>。"
         "<br><span class='note'>口径：净利润 = 账户累计收益 − 运行时实扣（真实扣费，不是年度计提）；"
-        "评分 / 档位 / 奖励只在月报出，周报不展开运行时费用。</span>"
+        "评分 / 档位 / 奖励只在年报出（每年 1 月 1 日），周报不展开运行时费用。</span>"
         "</div>")
 
 
@@ -1056,8 +1079,8 @@ def _section_repo(repo, as_of):
     head = "<h3>现金层：逆回购盈亏分析</h3>"
     note = (
         '<div class="card"><b>口径说明（为什么两层要用不同窗口）：</b><br>'
-        "· <b>权益层</b>按「决策→成交→评估」窗口算：周六 20:00 决策 → 下周一挂限价单/开盘卖出 → 下周三收盘价评估；"
-        "若周六没有变更（继续持仓/观望），则本期只比「上周五收盘价 → 本周三收盘价」。<br>"
+        "· <b>权益层</b>按「决策→成交→评估」窗口算：周三/周六 20:30 决策 → 次一交易日挂限价单/开盘卖出 → 下一个决策日收盘价评估；"
+        "若决策日没有变更（继续持仓/观望），则本期只比「上一决策日收盘价 → 本决策日收盘价」。<br>"
         "· <b>现金层</b>按持有天数算：观望资金放全市场货基池（T+0 快赎每支 1 万/日）、朝朝宝顶流动性；"
         "逆回购只在季末/长假前的脉冲窗口操作（见技能 §5.7c）；"
         "长假前买更长档。跨期比较时把「覆盖天数」和"
@@ -1162,199 +1185,225 @@ def _md_block(text):
     return "\n".join(out)
 
 
-def build_monthly_report(*, month, data):
-    """data 由 monthly.py 汇总（各账本的月度指标、交易、事件）。"""
-    ledgers = data.get("ledgers") or {}
-    title = f"投资月报（模拟盘）· {month}"
-    parts = [f"<h1>{_esc(title)}</h1>",
-             f'<div class="sub">统计区间：{_esc(data.get("start"))} ~ {_esc(data.get("end"))}｜'
-             f"生成：{_esc(datetime.datetime.now().strftime('%Y-%m-%d %H:%M'))}</div>"]
-    # 一、上月策略复盘（月报不能只做统计：2026-10-30）；只摘 retro.md，不伪造内容
+def _border_card() -> str:
+    return ("<h2>边界</h2><div class='card note'>模拟盘，不构成投资建议；触发价不是保证成交价"
+            "（跳空按开盘价）；仅 A 股主板 + 场内 ETF（本部署本金 5 万）。</div>")
+
+
+def _m_metrics_table(m) -> str:
+    rows = [
+        ("月度收益", f"{_pct(m.get('ret_month'), arrow=True)}（{_money(m.get('pnl_month'))} 元）"),
+        ("总收益（累计，自建仓）", f"{_pct(m.get('total_return'), arrow=True)}"
+                                f"（{_money(m.get('total_pnl'))} 元；本金 {_money(m.get('capital'))} 元）"),
+        ("同期沪深300", _pct(m.get("bench_month"), arrow=True)),
+        ("超额", _pct(m.get("excess"), arrow=True)),
+        ("月内最大回撤", _pct(m.get("mdd"), arrow=True)),
+        ("期末仓位", _pct(m.get("weight_end"))),
+        ("现金层利息", f"{_money(m.get('cash_yield'))} 元"),
+        ("已实现盈亏", f"{_money(m.get('realized'))} 元"),
+        ("浮动盈亏", f"{_money(m.get('unrealized'))} 元"),
+        ("费用", f"{_money(m.get('fees'))} 元（本金 {_pct(m.get('fees_pct'))}）"),
+        ("成交笔数", f"{m.get('trades', 0)} 笔（买 {m.get('buys', 0)} / 卖 {m.get('sells', 0)}）"),
+        ("止损/熔断", f"{m.get('stop_outs', 0)} 次"),
+        ("可投资本", f"{_money(m.get('investable'))}"
+                    f"（本金 {_money(m.get('capital'))} + 已实现盈利 {_money(m.get('gain'))}）"),
+    ]
+    return ("<table>" + "".join(f"<tr><th>{_esc(k)}</th><td>{_esc(v)}</td></tr>" for k, v in rows)
+            + "</table>")
+
+
+_ACT_CN = {"buy": "买入", "sell": "卖出", "buy_open": "买入", "sell_open": "卖出",
+           "buy_limit": "买入", "sell_stop": "卖出"}
+
+
+def _act_cn(action) -> str:
+    """成交动作中文化（账本存 buy/sell 等代码，报告给人看）。"""
+    a = str(action or "")
+    return _ACT_CN.get(a.lower(), a)
+
+
+def _m_trades_table(trades) -> str:
+    if not trades:
+        return "<div class='note'>本月没有成交（挂单未触发或对照账本不调仓）。</div>"
+    head = ("<table><tr><th>日期</th><th>名称</th><th>动作</th><th class='num'>股数</th>"
+            "<th class='num'>价</th><th class='num'>金额</th><th class='num'>已实现</th></tr>")
+    body = "".join(
+        "<tr>"
+        f"<td>{_esc(t.get('date'))}</td>"
+        f"<td>{_esc(t.get('name') or t.get('code'))}</td>"
+        f"<td>{_esc(_act_cn(t.get('action')))}</td>"
+        f"<td class='num'>{_num(t.get('shares'), 0)}</td>"
+        f"<td class='num'>{_num(t.get('price'), 3)}</td>"
+        f"<td class='num'>{_money(t.get('amount'))}</td>"
+        f"<td class='num {_cls(t.get('realized_pnl'))}'>{_money(t.get('realized_pnl'))}</td>"
+        "</tr>" for t in trades)
+    return head + body + "</table>"
+
+
+def _monthly_main(m, info, data) -> list:
+    """月报主区（周报式）：一句话 + ①赚没赚 + ②做了什么 + ③记分卡 + ④下月计划。"""
+    nt = m.get("net") or {}
+    parts = []
+    one = (f"本月净值 <b>{_money(m.get('nav_end'))}</b>，账户收益 {_money(m.get('pnl_month'))} 元"
+           f"（{_pct(m.get('ret_month'), arrow=True)}）；同期沪深300 {_pct(m.get('bench_month'), arrow=True)}，"
+           f"超额 {_pct(m.get('excess'), arrow=True)}")
+    if not nt.get("error") and nt.get("net_profit") is not None:
+        one += (f"；累计净利润（扣 token 实花）{_money(nt.get('net_profit'))} 元"
+                f"（已扣 token 实花 {_money(nt.get('token_spent'))} 元，净收益率 {_pct(nt.get('net_rate'))}）")
+    one += f"；成交 {m.get('trades', 0)} 笔。"
+    parts.append(f'<div class="card"><b>一句话：</b>{one}</div>')
+
+    cells = "".join(
+        f'<div class="kpi"><div class="k">{_esc(k)}</div><div class="v {_cls(c)}">{_esc(v)}</div>'
+        f'<div class="n">{_esc(n)}</div></div>'
+        for k, v, n, c in (
+            ("月度收益", f"{_money(m.get('pnl_month'))} 元", _pct(m.get("ret_month"), arrow=True),
+             m.get("ret_month")),
+            ("累计收益", _pct(m.get("total_return"), arrow=True),
+             f"{_money(m.get('total_pnl'))} 元（本金 {_money(m.get('capital'))} 元）", m.get("total_return")),
+            ("同期沪深300", _pct(m.get("bench_month"), arrow=True), "同期基准", m.get("bench_month")),
+            ("超额", _pct(m.get("excess"), arrow=True), "策略 − 沪深300", m.get("excess")),
+        ))
+    extra = (f"最大回撤 {_pct(m.get('mdd'), arrow=True)}｜期末仓位 {_pct(m.get('weight_end'))}"
+             f"｜现金层利息 {_money(m.get('cash_yield'))} 元｜费用 {_money(m.get('fees'))} 元")
+    parts.append("<h2>① 这个月赚了没</h2>")
+    parts.append(f'<div class="card"><div class="kpis">{cells}</div>'
+                 f'<div class="note" style="margin-top:10px">{extra}</div></div>')
+
+    parts.append("<h2>② 这个月做了什么</h2>")
+    trades = info.get("trades") or []
+    parts.append(f"<div class='card'>{_m_trades_table(trades)}"
+                 f"<div class='note' style='margin-top:8px'>"
+                 f"费用 {_money(m.get('fees'))} 元｜已实现 {_money(m.get('realized'))} 元"
+                 f"｜浮动 {_money(m.get('unrealized'))} 元｜止损/熔断 {m.get('stop_outs', 0)} 次</div></div>")
+
+    sc = data.get("scorecard") or ""
+    parts.append("<h2>③ 记分卡判定</h2>")
+    if sc:
+        lines = [x.strip() for x in sc.splitlines() if x.strip()]
+        parts.append("<div class='card'>" + _md_block("\n".join(lines[:4])) + "</div>")
+    else:
+        parts.append("<div class='card note'>本月未生成记分卡。</div>")
+
+    parts.append("<h2>④ 下月什么条件动手</h2>")
+    nxt = data.get("next_month_plan") or [
+        "每周三、周六 20:30 继续按同一套规则决策，不为单月结果调阈值；",
+        "净值低于峰值 15% 触发组合熔断，当月不再开新仓；",
+        "样本满 12 周且 ≥10 笔平仓后，才用记分卡做「可不可行」的判定；",
+        "任何规则改动必须先走一次 git 提交（纪律见 references/engine-notes.md §六）。",
+    ]
+    parts.append("<div class='card'><ul>" + "".join(f"<li>{_esc(x)}</li>" for x in nxt) + "</ul></div>")
+    return parts
+
+
+def _monthly_details(data, ledgers) -> list:
+    """月报明细（折叠）：复盘 / 技能优化 / 诊断 / 五问 / 本年计划 / 收益拆解 / 账本对比 / 完整指标。"""
     retro = data.get("retro") or {}
-    parts.append("<h2>一、上月策略复盘与改进</h2>")
+    sc = data.get("scorecard") or ""
+    parts = ["<details><summary>看明细：复盘 / 技能优化 / 诊断 / 五问 / 本年计划 / "
+             "收益拆解 / 按标的 / 完整指标</summary>"]
+    parts.append("<h3>上月策略复盘与改进</h3>")
     if retro.get("strategy"):
         parts.append("<div class='card'>" + _md_block(retro["strategy"]) + "</div>")
     else:
         parts.append("<div class='card note'>⚠ 未找到 <code>out/team/retro.md</code> 的「策略复盘」小节"
-                     "（先跑 T10 复盘员）。月报不能只做统计：本节要写清上月策略假设哪里值得改，"
-                     "每条带证据。</div>")
-    diag = data.get("diagnostics") or []
-    if diag:
-        rows = []
-        for d in diag:
-            for lvl, txt in (d.get("items") or []):
-                rows.append(f"<li>{'⚠ ' if lvl == 'warn' else ''}"
-                            f"<b>{_esc(d.get('label'))}</b>｜{_esc(txt)}</li>")
-        parts.append("<div class='card'><b>自动诊断信号（代码只报事实，判断在复盘）：</b><ul>"
-                     + "".join(rows) + "</ul></div>")
-    # 二、技能优化（A 类当场执行、B 类待拍板）
-    parts.append("<h2>二、技能优化（A 类已执行 / B 类待拍板）</h2>")
+                     "（先跑 T10 复盘员）。</div>")
+    parts.append("<h3>技能优化（A 类已执行 / B 类待拍板）</h3>")
     if retro.get("optimization"):
         parts.append("<div class='card'>" + _md_block(retro["optimization"]) + "</div>")
         ost = data.get("opt_stats") or {}
         if ost.get("total"):
             parts.append(f"<div class='card'><b>清单完成度：{ost.get('done')}/{ost.get('total')}</b>"
-                         "（A 类由 Lead 在月报任务内直接改代码/文档并 git 提交；"
-                         "B 类写 <code>out/team/pending_changes.md</code> 等用户拍板）</div>")
+                         "（A 类月报任务内直接改代码/文档并提交；B 类写 "
+                         "<code>out/team/pending_changes.md</code> 等拍板）</div>")
     else:
-        parts.append("<div class='card note'>⚠ 未找到 <code>out/team/retro.md</code> 的「技能优化」小节"
-                     "（先跑 T10 复盘员）。T10 必须扫技能自身的 bug/文档/报告/性能/测试缺口，"
-                     "A 类由 Lead 当场执行。</div>")
-    parts.append("<h2>三、数据统计</h2>")
-    # 各账本 KPI
-    cards = []
-    for name, info in ledgers.items():
-        m = info.get("month") or {}
-        cards.append(
-            f'<div class="kpi"><div class="k">{_esc(info.get("label"))}账本｜净值</div>'
-            f'<div class="v">{_money(m.get("nav_end"))}</div>'
-            f'<div class="n">月度收益 {_pct(m.get("ret_month"), arrow=True)}｜'
-            f'总收益（累计）{_pct(m.get("total_return"), arrow=True)}｜'
-            f'同期沪深300 {_pct(m.get("bench_month"), arrow=True)}｜'
-            f'超额 {_pct(m.get("excess"), arrow=True)}</div></div>'
-)
-    parts.append('<div class="kpis">' + "".join(cards) + "</div>")
-    # 毛利 → 净利对照（一切利润扣 token 后计算，不得只给毛利）
-    net_cards = []
-    for name, info in ledgers.items():
-        nt = ((info.get("month") or {}).get("net") or {})
-        if nt.get("error"):
-            net_cards.append(f"<div class='card warn'><b>{_esc(info.get('label'))}：</b>"
-                             f"净利润口径不可用（{_esc(nt['error'])}）</div>")
-            continue
-        reward = (f"｜奖励：{_esc(nt.get('reward_note'))}" if nt.get("reward_pending")
-                  else ("｜奖励：评估期已到" if nt.get("reward_pending") is False else ""))
-        net_cards.append(
-            f"<div class='card'><b>{_esc(info.get('label'))}：</b>"
-            f"账户收益 {_money(nt.get('gross_profit'))} 元 − token 实花 "
-            f"{_money(nt.get('token_spent'))} 元 = 净利润 <b>{_money(nt.get('net_profit'))} 元</b>；"
-            f"净收益率 <b>{_pct(nt.get('net_rate'), arrow=True)}</b>"
-            f"（档位 {_esc(nt.get('grade') or 'n/a')}）{reward}"
-            "<br><span class='note'>口径：token 实花取 out/budget.json 累计 spent，"
-            "不是年度计提；奖励评估期 2027-10-30 起评判。</span></div>"
-)
-    parts.extend(net_cards)
-    # 每个账本
-    for name, info in ledgers.items():
-        m = info.get("month") or {}
-        parts.append(f"<h2>{_esc(info.get('label'))}账本（{_esc(name)}）</h2>")
-        rows = [
-            ("月度收益", f"{_pct(m.get('ret_month'), arrow=True)}（{_money(m.get('pnl_month'))} 元）"),
-            ("总收益（累计，自建仓）", f"{_pct(m.get('total_return'), arrow=True)}"
-                                    f"（{_money(m.get('total_pnl'))} 元；本金 {_money(m.get('capital'))} 元）"),
-            ("同期沪深300", _pct(m.get("bench_month"), arrow=True)),
-            ("超额", _pct(m.get("excess"), arrow=True)),
-            ("月内最大回撤", _pct(m.get("mdd"), arrow=True)),
-            ("期末仓位", _pct(m.get("weight_end"))),
-            ("现金层利息", f"{_money(m.get('cash_yield'))} 元"),
-            ("已实现盈亏", f"{_money(m.get('realized'))} 元"),
-            ("浮动盈亏", f"{_money(m.get('unrealized'))} 元"),
-            ("费用", f"{_money(m.get('fees'))} 元（本金 {_pct(m.get('fees_pct'))}）"),
-            ("成交笔数", f"{m.get('trades', 0)} 笔（买 {m.get('buys', 0)} / 卖 {m.get('sells', 0)}）"),
-            ("止损/熔断", f"{m.get('stop_outs', 0)} 次"),
-            ("可投资本", f"{_money(m.get('investable'))}"
-                       f"（本金 {_money(m.get('capital'))} + 已实现盈利 {_money(m.get('gain'))}）"),
-        ]
-        parts.append('<div class="card"><table>'
-                     + "".join(f"<tr><th>{_esc(k)}</th><td>{_esc(v)}</td></tr>" for k, v in rows)
-                     + "</table></div>")
-        # 收益拆解（权益 / 场外 R2 / 现金三层）：2026-11-08月报固定体现
-        bd = info.get("breakdown") or {}
-        if bd:
-            try:
-                parts.append("<h3>收益拆解（权益 / 场外 R2 / 现金三层）</h3>"
-                             "<div class='card'>" + breakdown.table_html(bd)
-                             + f"<div class='note'>{_esc(breakdown.note_text(bd))}</div></div>")
-            except Exception as exc:                    # noqa: BLE001
-                parts.append(f"<div class='card note'>收益拆解未生成（{_esc(exc)}）</div>")
-        # 本月成交
-        trades = info.get("trades") or []
-        if trades:
-            body = "".join(
-                "<tr>"
-                f"<td>{_esc(t.get('date'))}</td><td>{_esc(t.get('code'))}</td>"
-                f"<td>{_esc(t.get('name'))}</td><td>{_esc(t.get('action'))}</td>"
-                f"<td class='num'>{_num(t.get('shares'), 0)}</td>"
-                f"<td class='num'>{_num(t.get('price'), 3)}</td>"
-                f"<td class='num'>{_money(t.get('amount'))}</td>"
-                f"<td class='num'>{_money(t.get('fee'))}</td>"
-                f"<td class='num {_cls(t.get('realized_pnl'))}'>{_money(t.get('realized_pnl'))}</td>"
-                f"<td class='note'>{_esc(t.get('why') or '')}</td>"
-                "</tr>" for t in trades
-)
-            parts.append(
-                "<h3>本月成交</h3><table><tr><th>日期</th><th>代码</th><th>名称</th><th>动作</th>"
-                "<th class='num'>股数</th><th class='num'>价</th><th class='num'>金额</th>"
-                "<th class='num'>费用</th><th class='num'>已实现</th><th>原因</th></tr>"
-                + body + "</table>"
-)
-        else:
-            parts.append("<h3>本月成交</h3><div class='note'>本月没有成交（挂单未触发或对照账本不调仓）。</div>")
-        # 按标的归因
-        by_sym = info.get("by_symbol") or []
-        if by_sym:
-            body = "".join(
-                f"<tr><td>{_esc(s.get('code'))}</td><td>{_esc(s.get('name'))}</td>"
-                f"<td class='num'>{_money(s.get('realized_pnl'))}</td>"
-                f"<td class='num'>{s.get('trades', 0)}</td></tr>" for s in by_sym
-)
-            parts.append("<h3>本月已实现盈亏（按标的）</h3><table><tr><th>代码</th><th>名称</th>"
-                         "<th class='num'>已实现</th><th class='num'>成交笔数</th></tr>" + body + "</table>")
-        # 现金层/权益层拆账
-        parts.append(
-            "<div class='card'><b>拆开看（不许只报总收益）：</b>"
-            f"本月 现金层利息 {_money(m.get('cash_yield'))} 元 + 权益层盈亏 {_money(m.get('equity_pnl'))} 元"
-            f" ≈ 月度收益 {_pct(m.get('ret_month'), arrow=True)}（{_money(m.get('pnl_month'))} 元）｜"
-            f"<b>总收益（累计，自建仓）{_pct(m.get('total_return'), arrow=True)}"
-            f"（{_money(m.get('total_pnl'))} 元）</b></div>"
-)
-    # 账本对比
-    parts.append("<h2>账本对比</h2>")
-    body = ""
-    for name, info in ledgers.items():
-        m = info.get("month") or {}
-        body += (f"<tr><td>{_esc(info.get('label'))}</td><td>{_esc(info.get('mode'))}</td>"
-                 f"<td class='num {_cls(m.get('ret_month'))}'>{_pct(m.get('ret_month'), arrow=True)}</td>"
-                 f"<td class='num {_cls(m.get('total_return'))}'>{_pct(m.get('total_return'), arrow=True)}</td>"
-                 f"<td class='num'>{_pct(m.get('mdd'), arrow=True)}</td>"
-                 f"<td class='num'>{m.get('trades', 0)}</td>"
-                 f"<td class='num {_cls(m.get('equity_pnl'))}'>{_money(m.get('equity_pnl'))}</td></tr>")
-    parts.append("<table><tr><th>账本</th><th>调仓模式</th><th class='num'>月度收益</th>"
-                 "<th class='num'>总收益（累计）</th><th class='num'>最大回撤</th><th class='num'>成交笔数</th>"
-                 "<th class='num'>权益层盈亏</th></tr>" + body + "</table>")
-    # 记分卡
-    sc = data.get("scorecard") or ""
-    if sc:
-        parts.append("<h2>记分卡判定</h2><div class='card'>" + _md_block(sc) + "</div>")
-    # 策略可行性判定（五问，来源 out/team/viability_<月>.md）
+        parts.append("<div class='card note'>⚠ 未找到 <code>out/team/retro.md</code> 的「技能优化」小节。</div>")
+    diag = data.get("diagnostics") or []
+    if diag:
+        rows = []
+        for d in diag:
+            for item in (d.get("items") or []):
+                # C7：历史诊断产物可能是 (level, text) 之外的形状，不能让报告整页崩
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    rows.append(f"<li><b>{_esc(d.get('label'))}</b>｜{_esc(item)}</li>")
+                    continue
+                _lvl, _txt = item[0], item[1]
+                rows.append(f"<li>{'⚠ ' if _lvl == 'warn' else ''}"
+                            f"<b>{_esc(d.get('label'))}</b>｜{_esc(_txt)}</li>")
+        parts.append("<h3>自动诊断信号（代码只报事实，判断在复盘）</h3>"
+                     "<div class='card'><ul>" + "".join(rows) + "</ul></div>")
+    parts.append("<h3>策略可行性判定（五问）</h3>")
     _v = data.get("viability") or ""
-    parts.append("<h2>策略可行性判定（五问）</h2>")
     if _v:
         parts.append("<div class='card'>" + _md_block(_v) + "</div>")
     else:
         parts.append("<div class='card warn'>⚠ 未找到 <code>out/team/viability_&lt;月&gt;.md</code>："
                      "月报必须回答「策略还可行吗」（五问 + 结论三选一）。</div>")
-    # 本年计划对齐（年报写的 annual_plan.md；月报只读、逐条回答「每月必答」）
+    parts.append("<h3>本年计划对齐</h3>")
     _ap = data.get("annual_plan") or ""
-    parts.append("<h2>本年计划对齐</h2>")
     if _ap:
         parts.append("<div class='card'>" + _md_block(_ap) + "</div>")
     else:
         parts.append("<div class='card'>本年度无年度计划（年报未生成）；下一年 1 月 1 日年报会写 "
                      "<code>out/team/annual_plan.md</code>。</div>")
-    # 下月计划
-    nxt = data.get("next_month_plan") or []
-    if nxt:
-        parts.append("<h2>下月计划</h2><div class='card'><ul>"
-                     + "".join(f"<li>{_esc(x)}</li>" for x in nxt) + "</ul></div>")
-    else:
+    if sc:
+        parts.append("<h3>记分卡全文</h3><div class='card'>" + _md_block(sc) + "</div>")
+    for name, inf in ledgers.items():
+        mm = inf.get("month") or {}
+        parts.append(f"<h3>{_esc(inf.get('label') or name)}账本（{_esc(name)}）</h3>"
+                     f"<div class='card'>{_m_metrics_table(mm)}</div>")
+        bd = inf.get("breakdown") or {}
+        if bd:
+            try:
+                parts.append("<h4>收益拆解（权益 / 场外 R2 / 现金三层）</h4>"
+                             "<div class='card'>" + breakdown.table_html(bd)
+                             + f"<div class='note'>{_esc(breakdown.note_text(bd))}</div></div>")
+            except Exception as exc:                    # noqa: BLE001
+                print(f"[report_html] 收益拆解生成失败，已跳过：{exc}", file=sys.stderr)
+                parts.append(f"<div class='card note'>收益拆解未生成（{_esc(exc)}）</div>")
+        by_sym = inf.get("by_symbol") or []
+        if by_sym:
+            body = "".join(
+                f"<tr><td>{_esc(s.get('code'))}</td><td>{_esc(s.get('name'))}</td>"
+                f"<td class='num'>{_money(s.get('realized_pnl'))}</td>"
+                f"<td class='num'>{s.get('trades', 0)}</td></tr>" for s in by_sym)
+            parts.append("<h4>本月已实现盈亏（按标的）</h4>"
+                         "<table><tr><th>代码</th><th>名称</th>"
+                         "<th class='num'>已实现</th><th class='num'>成交笔数</th></tr>" + body + "</table>")
         parts.append(
-            "<h2>下月计划</h2><div class='card'><ul>"
-            "<li>每周六 20:00 继续按同一套规则决策，不为单月结果调阈值；</li>"
-            "<li>净值低于峰值 15% 触发组合熔断，当月不再开新仓；</li>"
-            "<li>样本满 12 周且 ≥10 笔平仓后，才用记分卡做「可不可行」的判定；</li>"
-            "<li>任何规则改动必须先走一次 git 提交（纪律见 references/engine-notes.md §六）。</li></ul></div>"
-)
+            "<div class='card'><b>拆开看（不许只报总收益）：</b>"
+            f"本月 现金层利息 {_money(mm.get('cash_yield'))} 元 + 权益层盈亏 "
+            f"{_money(mm.get('equity_pnl'))} 元 ≈ 月度收益 "
+            f"{_pct(mm.get('ret_month'), arrow=True)}（{_money(mm.get('pnl_month'))} 元）｜"
+            f"<b>总收益（累计，自建仓）{_pct(mm.get('total_return'), arrow=True)}"
+            f"（{_money(mm.get('total_pnl'))} 元）</b></div>")
+    parts.append("</details>")
+    return parts
+
+
+def build_monthly_report(*, month, data):
+    """月报 HTML（简单版，与周报同风格）：首屏短，明细折叠。"""
+    ledgers = data.get("ledgers") or {}
+    title = f"投资月报（模拟盘）· {month}"
+    start, end = data.get("start"), data.get("end")
+    names = list(ledgers.keys())
+    primary = names[0] if names else None
+    info = ledgers.get(primary) or {}
+    m = info.get("month") or {}
+    label = info.get("label") or primary or ""
+    parts = [f"<h1>{_esc(title)}</h1>",
+             '<div class="sub">'
+             f"统计区间：{_esc(start)} ~ {_esc(end)}｜账本：{_esc(label)}｜"
+             f"生成：{_esc(datetime.datetime.now().strftime('%Y-%m-%d %H:%M'))}"
+             "</div>"]
+    if m and not m.get("no_data"):
+        parts.extend(_monthly_main(m, info, data))
+    else:
+        parts.append("<div class='card warn'>本月没有可读的净值/交易数据"
+                     "（账本刚重置或该月无净值点，报告不渲染虚假的 0.00% 收益）；"
+                     "复盘/五问等文字仍见下方明细。</div>")
+    parts.extend(_monthly_details(data, ledgers))
+    parts.append(_border_card())
     return _doc(title, "".join(parts))
 
 

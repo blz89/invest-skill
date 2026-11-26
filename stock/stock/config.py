@@ -22,7 +22,7 @@ WORK_DIR = Path(os.environ.get("STOCK_WORK_DIR") or DATA_DIR)   # 工作目录�
 
 # ---------------------------------------------------------------- 统一运行数据
 # 所有「跑出来的数据」都落 ROOT/data 下，不再分散在 ~/.dsh/work/<skill>：
-#   data\invest  投资技能的 cache/out/paper
+#   data\invest  投资技能的 cache/out/paper（原 D:\dsh\work\invest）
 #   data\logs    每日巡检日志（原 _ops\logs）
 #   data\archive 每日归档（原 _ops\archive）
 # 账本/持仓状态（paper\state_*.json、*.key、*_latest.json）不参与清理。

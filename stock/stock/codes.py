@@ -45,9 +45,15 @@ def parse(code: str, kind: str | None = None) -> dict:
     if not raw:
         raise CodeError("code 为空")
     m = _RE_DIGITS.search(raw)
-    if not m:
-        raise CodeError(f"不认识代码：{code!r}")
-    sym = m.group(0)
+    if m:
+        sym = m.group(0)
+    else:
+        # 短代码（如 "82" / "9"）按纯数字补零到 6 位（2026-11-26：fuyao.thscode 隐藏红）
+        _digits = re.sub(r"\D", "", raw)
+        if _digits and len(_digits) <= 4:
+            sym = _digits.zfill(6)
+        else:
+            raise CodeError(f"不认识代码：{code!r}")
     up = raw.upper()
     market = None
     # 显式前缀：sh600519 / sz000001 / 600519.SH / sh.600519

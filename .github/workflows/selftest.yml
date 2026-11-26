@@ -27,7 +27,7 @@ jobs:
           pip install -e ./stock
           pip install pypdf baostock
 
-      - name: 投资技能离线自检（23 套）
+      - name: 投资技能离线自检（30 套）
         run: python scripts/selftest_all.py --fast
 
       - name: 数据引擎单元测试

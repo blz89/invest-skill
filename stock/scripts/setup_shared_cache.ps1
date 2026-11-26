@@ -19,10 +19,10 @@ Behaviour
 - Junctions on the same volume need no admin rights.
 
 Usage
-    powershell -NoProfile -ExecutionPolicy Bypass -File <本技能目录>\stock\scripts\setup_shared_cache.ps1
-    powershell -NoProfile -ExecutionPolicy Bypass -File <本技能目录>\stock\scripts\setup_shared_cache.ps1 -Execute
-    ... -Execute -SharedDir <本技能目录>\stock\data\shared -SkipInvest   (no-op guard)
-    powershell -NoProfile -ExecutionPolicy Bypass -File <本技能目录>\stock\scripts\setup_shared_cache.ps1 -Rollback
+    powershell -NoProfile -ExecutionPolicy Bypass -File D:\skills\invest\stock\scripts\setup_shared_cache.ps1
+    powershell -NoProfile -ExecutionPolicy Bypass -File D:\skills\invest\stock\scripts\setup_shared_cache.ps1 -Execute
+    ... -Execute -SharedDir D:\skills\invest\stock\data\shared -SkipInvest   (no-op guard)
+    powershell -NoProfile -ExecutionPolicy Bypass -File D:\skills\invest\stock\scripts\setup_shared_cache.ps1 -Rollback
         (undo: delete the junction and rename the newest <cache>.bak-* back into place)
 #>
 param(

@@ -4,7 +4,7 @@ r"""数据层：取数接口层（东财/新浪/中证/百度/同花顺/腾讯/�
 职责
 ----
 各策略技能（invest）共用的数据层：本模块是唯一实现，技能侧只注入各自的
-config 模块，共享同一份缓存、同一套自检。详见 <本技能目录>\stock\README.md「取数接口层」。
+config 模块，共享同一份缓存、同一套自检。详见 D:\skills\invest\stock\README.md「取数接口层」。
 
 三条铁律
 --------
@@ -58,7 +58,7 @@ from ..codes import ETF_PREFIXES, etf_symbol, is_etf_code, norm_code, to_sina
 # ---------------------------------------------------------------- 注入态
 _C = None                    # 技能的 config 模块（init 时注入）
 FLAVOR = "invest"             # 技能标识：少数源选择/后处理按它分支
-ROOT = ""                    # stock 包根（<本技能目录>\stock）
+ROOT = ""                    # stock 包根（D:\skills\invest\stock）
 CACHE_ROOT = ""              # 技能缓存目录（config.CACHE_DIR）
 OUT_ROOT = ""                # 技能产出目录（config.OUT_DIR）
 _SCALE_CACHE_FILE = ""       # ETF 规模 last-good 缓存文件
@@ -163,7 +163,7 @@ def _now() -> dt.datetime:
 # ============================ 数据日 / 离线冻结（2026-11-16 架构改造）================
 # 新架构（用户 2026-11-16 口径）：
 #   数据更新与巡检全部在本机自跑（Windows 计划任务 \\DSH-DailyPatrol，交易日 19:00 起），
-#   DSH 只做筛选与记录；决策日（周六 20:00）**不跑取数**，读本机最后一份完整快照。
+#   DSH 只做筛选与记录；决策日（周三/周六 20:30）**不跑取数**，读本机最后一份完整快照。
 # 因此数据层需要两个开关：
 #   A_SHARE_DATA_DATE=YYYY-MM-DD  把「读/写哪一天的数据」钉死（默认=真实今天）
 #   A_SHARE_OFFLINE=1             只读缓存，缺什么就报错，绝不联网
@@ -373,7 +373,7 @@ def _cached(kind: str, key: str, loader, post=None, fail_ttl_h: float = 0.0,
     off = offline()
     # 离线模式（决策日冻结快照）下忽略强制刷新：A_SHARE_FORCE_REFRESH 是「允许联网重取」的
     # 授权，与「绝不联网」互斥，冻结优先——paper.py 的陈旧自愈会临时置这个变量，不能因此
-    # 让周六决策跑出联网取数。
+    # 让决策日跑出联网取数。
     force = (force or _force_refresh()) and not off
 
     def _mark_fail():

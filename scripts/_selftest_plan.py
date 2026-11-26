@@ -48,10 +48,10 @@ def main() -> int:
         config.EXEC["stock_weighting"] = "rank"
         regime = {"base_gross": 0.35}
 
-        print("1) 排名篮子：1 只买入区 + 3 只观察区 → 4 只都在篮子里，按排名给权重")
+        print("1) 排名篮子：1 只买入区 + 3 只观察区 → 4 只都在篮子里（按 ≤60% 档 = 4 只），按排名给权重")
         res = [mk("a", "甲", 72.6, "买入区"), mk("b", "乙", 69.0, "观察"),
                mk("c", "丙", 68.1, "观察"), mk("d", "丁", 66.0, "观察")]
-        chosen, note = plan.pick(res, regime)
+        chosen, note = plan.pick(res, regime, gross=0.60)
         check("返回 4 只", len(chosen) == 4, str(len(chosen)))
         check("权重系数：买入区 1.00，观察区一律 0（不建仓）",
               [c["mult"] for c in chosen] == [1.0, 0.0, 0.0, 0.0],
@@ -73,23 +73,23 @@ def main() -> int:
               "0.00/0.00" in note2 and all(c["r"]["verdict"] == "观察" for c in chosen2), note2)
         check("note 不含核心仓", "核心仓" not in note2)
 
-        print("8b) 排名篮子只数随档位：≤35% 4 只、≤60% 5 只、>60% 6 只")
+        print("8b) 排名篮子只数随档位：≤35% 3 只、≤60% 4 只、>60% 5 只（2026-11-25 B-13 由 4/5/6 下调）")
         _many = [mk("c%d" % i, "C%d" % i, 80 - i, "买入区") for i in range(1, 9)]
         _reg = {"base_gross": 0.35}
         c35, _ = plan.pick(_many, _reg, gross=0.35)
-        check("权益 35% 取 4 只", len(c35) == 4, len(c35))
+        check("权益 35% 取 3 只", len(c35) == 3, len(c35))
         c60, _ = plan.pick(_many, _reg, gross=0.60)
-        check("权益 60% 取 5 只", len(c60) == 5, len(c60))
+        check("权益 60% 取 4 只", len(c60) == 4, len(c60))
         c80, _ = plan.pick(_many, _reg, gross=0.80)
-        check("权益 80% 取 6 只", len(c80) == 6, len(c80))
+        check("权益 80% 取 5 只", len(c80) == 5, len(c80))
         cdef, _ = plan.pick(_many, _reg)
-        check("不传 gross 用兜底 4 只", len(cdef) == 4, len(cdef))
+        check("不传 gross 用兜底 3 只（防守档）", len(cdef) == 3, len(cdef))
 
-        print("3) 不传档位时按兜底 4 只：第 5 名起不纳入")
+        print("3) 不传档位时按兜底 3 只：第 4 名起不纳入")
         res3 = [mk(str(i), chr(65 + i), 70 - i, "观察") for i in range(6)]
         chosen3, note3 = plan.pick(res3, regime)
-        check("只取 4 只", len(chosen3) == 4)
-        check("note 说明有 2 只未纳入", "2 只" in note3, note3)
+        check("只取 3 只", len(chosen3) == 3)
+        check("note 说明有 3 只未纳入", "3 只" in note3, note3)
 
         print("4) 空池 / 全回避 → 不建仓、保持现金")
         chosen4, note4 = plan.pick([], regime)
@@ -101,7 +101,7 @@ def main() -> int:
         # 观察区 0 权重后，只有买入区才真建仓；这里全部用买入区，保持「4 只都建仓」的口径。
         res5 = [mk("a", "甲", 72.6, "买入区"), mk("b", "乙", 71.0, "买入区"),
                 mk("c", "丙", 70.5, "买入区"), mk("d", "丁", 70.1, "买入区")]
-        chosen5 = [c for c in plan.pick(res5, regime)[0]]
+        chosen5 = [c for c in plan.pick(res5, regime, gross=0.60)[0]]
         alloc = [a for a in plan.allocate(chosen5, regime, gross=0.35) if a.get("result")]
         total = sum(a["weight"] for a in alloc)
         check("目标总敞口≈35%", abs(total - 0.35) < 0.02, f"{total:.4f}")
@@ -149,7 +149,7 @@ def main() -> int:
 
         print("9) 配置默认值")
         check("stock_weighting 默认 rank", mode0 == "rank", str(mode0))
-        check("兜底 max_stock_names=4", int(config.EXEC.get("max_stock_names")) == 4)
+        check("兜底 max_stock_names=3（2026-11-25 B-13）", int(config.EXEC.get("max_stock_names")) == 3)
         check("rank_weights 4 档", list(config.EXEC.get("rank_weights") or []) ==
               [1.0, 0.85, 0.70, 0.55])
 
@@ -753,6 +753,123 @@ def main() -> int:
         check("有 stance → 直接用缓存", (_d2 or {}).get("stance") == "bear", str(_d2))
     finally:
         _rp.load_doc, _rp.build, _rp.write_doc = _saved_rp
+
+    print("20) 成本闸门：单笔佣金占比超限 → 拦下（不是买不起，是佣金吃掉太多）")
+    _lim = plan.cost_block_limit()
+    check("config 有 commission_ratio_block", _lim > 0, str(_lim))
+    check("闸门阈值必须高于 warn 阈值 0.005",
+          _lim > float(config.CAPITAL.get("commission_ratio_warn") or 0), str(_lim))
+    # 574.40 元 ETF 碎单 → 5 元佣金 = 0.87% > 0.65%：11-005 那笔的真实起因，必须拦
+    _b = plan.cost_blocked_row(574.40, True)
+    check("574 元 ETF 碎单被拦", _b is not None and _b["ratio"] > _lim, str(_b))
+    # 2,500 元个股 → 约 0.20%：放行
+    check("2,500 元个股放行", plan.cost_blocked_row(2500.0, False) is None,
+          str(plan.cost_blocked_row(2500.0, False)))
+    # 边界：5 元 ÷ 0.65% ≈ 769.2 元（ETF 无过户费，占比只由佣金决定）
+    check("767 元被拦（刚过线）", plan.cost_blocked_row(767.0, True) is not None)
+    check("771 元放行（刚过线）", plan.cost_blocked_row(771.0, True) is None)
+    check("ETF 800 元成本率 = 5/800",
+          abs(plan.buy_cost_ratio(800.0, True) - 5.0 / 800.0) < 1e-9,
+          str(plan.buy_cost_ratio(800.0, True)))
+    check("零金额/负金额不抛", plan.cost_blocked_row(0.0, True) is None
+          and plan.cost_blocked_row(-5.0, False) is None)
+
+    print("21) R2 钱账：与现金层的差额、年度增量、前瞻口径分开报（SKILL.md:818 的承诺）")
+    _pool = [{"ret_3y": 0.035, "mgmt_fee": 0.2}, {"ret_3y": 0.030, "mgmt_fee": 0.3},
+             {"ret_3y": 0.010, "mgmt_fee": 0.4}]
+    _ch = [{"code": "A", "amount": 2000.0, "ret_3y": 0.035, "mgmt_fee": 0.2},
+           {"code": "B", "amount": 1000.0, "ret_3y": 0.030, "mgmt_fee": 0.3}]
+    # CI 无本机数据缓存时 fwd_bond_yield() 返回 None，钱账会缺 fwd_* 两个字段；
+    # 数据缺失时注入固定曲线（0.0128 / 2026-11-25），有真实缓存则走真实值。
+    _orig_otc_fwd = plan._otc_fwd_yield
+    if plan._otc_fwd_yield()[0] is None:
+        plan._otc_fwd_yield = lambda: (0.0120, "2026-11-25")
+    _ma = plan._otc_money_account(_ch, _pool)
+    for _k in ("amount", "cash_rate", "ret_3y_wavg", "ret_3y_median", "fwd_yield_proxy",
+               "fwd_net_rate", "hist_gap_vs_cash", "fwd_gap_vs_cash",
+               "hist_annual_extra_cny", "fwd_annual_extra_cny", "verdict"):
+        check(f"钱账字段 {_k} 存在", _k in _ma, str(sorted(_ma)))
+    check("金额合计 3000", abs(float(_ma.get("amount") or 0) - 3000.0) < 1e-9, str(_ma.get("amount")))
+    check("加权 ret_3y = (2000×3.5% + 1000×3.0%)/3000",
+          abs(float(_ma.get("ret_3y_wavg") or 0) - 0.0333333) < 1e-6, str(_ma.get("ret_3y_wavg")))
+    check("mgmt_fee 百分数刻度被归一（0.2→0.002、0.3→0.003，加权 0.002333）",
+          abs(float(_ma.get("op_fee_wavg") or 0) - 0.0023333) < 1e-6, str(_ma.get("op_fee_wavg")))
+    check("现金层基准取 config.cash_rates()['money_fund']",
+          abs(float(_ma.get("cash_rate") or 0)
+              - float(config.cash_rates()["money_fund"])) < 1e-12, str(_ma.get("cash_rate")))
+    check("全池中位数取 ret_3y 中位（0.030）",
+          abs(float(_ma.get("ret_3y_median") or 0) - 0.030) < 1e-9, str(_ma.get("ret_3y_median")))
+    check("verdict 不是「缺数据」", "缺数据" not in str(_ma.get("verdict")), str(_ma.get("verdict")))
+    check("口径提醒写明只扣管理费", "托管" in str(_ma.get("op_fee_note")), str(_ma.get("op_fee_note")))
+    _ma2 = plan._otc_money_account([{"amount": 1000.0, "ret_3y": 0.001, "mgmt_fee": 0.2}], _pool)
+    check("后视/前瞻都低于货基 → 判「打不过现金层」",
+          "打不过" in str(_ma2.get("verdict")), str(_ma2.get("verdict")))
+    check("空组合不抛", plan._otc_money_account([], _pool).get("amount") == 0.0)
+    # R2 准入线（B 类 #22⑤）：前瞻年化超额 ≥ min_fwd_excess_annual
+    _adm = _ma.get("admission") or {}
+    check("钱账带 admission 块", isinstance(_adm, dict) and _adm, str(sorted(_adm)))
+    check("准入线 = config.RISK.wealth.otc.min_fwd_excess_annual（0.0025）",
+          abs(float(_adm.get("required_annual_excess") or 0) - 0.0025) < 1e-9,
+          str(_adm.get("required_annual_excess")))
+    check("实际超额 = fwd_gap_vs_cash", _adm.get("actual_annual_excess") == _ma.get("fwd_gap_vs_cash"))
+    check("打不过现金层 → admission.pass = False", _ma2.get("admission", {}).get("pass") is False)
+    _ma3 = plan._otc_money_account([{"amount": 1000.0, "ret_3y": 0.030, "mgmt_fee": 0.05}], _pool)
+    plan._otc_fwd_yield = _orig_otc_fwd
+    check("前瞻超额为正但未过 25bp → pass=False 且 verdict 点名准入线",
+          _ma3.get("admission", {}).get("pass") is False
+          and "未过准入线" in str(_ma3.get("verdict")), str(_ma3.get("verdict")))
+
+    # ---------------------------------------------------------------- 22) 赔率闸门
+    print("\n22) 赔率闸门（B 类 #14，按第 1 批限价算）")
+    _rr_lim = float(config.EXEC["min_risk_reward"])
+    check("config.EXEC.min_risk_reward = 1.5", abs(_rr_lim - 1.5) < 1e-9, str(_rr_lim))
+    _pr = {"target_price": 38.01, "stop_price": 18.53}
+    check("24) 赔率公式 =（目标−买价）÷（买价−止损）",
+          abs(float(plan.risk_reward_of(_pr, 22.21) or 0) - 4.293478) < 1e-5,
+          str(plan.risk_reward_of(_pr, 22.21)))
+    check("赔率 4.29 ≥1.5 → 放行", plan.rr_blocked_row(_pr, 22.21, "000999", "华润三九") is None)
+    _bad = plan.rr_blocked_row(_pr, 30.0, "000999", "华润三九")
+    check("赔率 0.70 <1.5 → 拦下", bool(_bad), str(_bad))
+    check("拦下记录带 code/name/price/risk_reward/limit/note",
+          all(k in (_bad or {}) for k in ("code", "name", "price", "risk_reward", "limit", "note")),
+          str(sorted((_bad or {}).keys())))
+    _fb = plan.rr_blocked_row(_pr, 18.0, "X", "Y")     # 买价 18 ≤ 止损价 → 数据异常
+    check("买价 ≤ 止损价（数据异常）→ 拦下（fail-closed）",
+          bool(_fb) and _fb.get("reason") == "pricing_missing", str(_fb))
+    _fp = plan.rr_blocked_row({}, 10.0, "X", "Y")
+    check("缺 pricing → 拦下（fail-closed）",
+          bool(_fp) and _fp.get("reason") == "pricing_missing", str(_fp))
+
+    # ---------------------------------------------------------------- 23) 往返成本闸门 / 只数 / R2 预算
+    print("\n23) 往返成本闸门 + 只数 + R2 预算（B 类 #11/#13/#14）")
+    _rt_lim = float(config.EXEC["max_roundtrip_cost"])
+    check("config.EXEC.max_roundtrip_cost = 0.006", abs(_rt_lim - 0.006) < 1e-9, str(_rt_lim))
+    _r574 = plan.roundtrip_blocked_row(574.40, True)
+    check("574.40 元 ETF 往返 1.74% → 拦下（2026-10-29 那笔）", bool(_r574), str(_r574))
+    _r1144 = plan.roundtrip_blocked_row(1144.0, False)
+    check("1,144 元股票往返 0.93% → 拦下", bool(_r1144), str(_r1144))
+    check("2,500 元股票往返 0.42% → 放行", plan.roundtrip_blocked_row(2500.0, False) is None)
+    check("2,222 元股票（1 手华润三九）往返 0.50% → 放行（不许误拦）",
+          plan.roundtrip_blocked_row(2222.0, False) is None,
+          str(plan.roundtrip_blocked_row(2222.0, False)))
+    check("2,000 元股票往返刚好压在 0.55% → 放行",
+          plan.roundtrip_blocked_row(2000.0, False) is None)
+    check("1,800 元股票往返 0.626% → 拦下", bool(plan.roundtrip_blocked_row(1800.0, False)))
+    check("max_stock_names_by_ratio = 3/4/5",
+          [int(v) for _, v in config.EXEC["max_stock_names_by_ratio"]] == [3, 4, 5],
+          str(config.EXEC["max_stock_names_by_ratio"]))
+    check("max_etf_names_by_ratio = 1/2/3",
+          [int(v) for _, v in config.EXEC["max_etf_names_by_ratio"]] == [1, 2, 3],
+          str(config.EXEC["max_etf_names_by_ratio"]))
+    _oc = config.RISK["wealth"]["otc"]
+    check("R2 场外只数上限 = 1", int(_oc.get("max_n") or 0) == 1, str(_oc.get("max_n")))
+    check("R2 腿预算硬上限 = 2,300 元", abs(float(_oc.get("budget_cap_cny") or 0) - 2300.0) < 1e-9,
+          str(_oc.get("budget_cap_cny")))
+    check("R2 下限校准到 0.10（否则每期假 WARN）",
+          abs(float(config.RISK["portfolio"]["r2_min"]) - 0.10) < 1e-9,
+          str(config.RISK["portfolio"]["r2_min"]))
+    check("场内 ETF 池只数上限未被 R2 改动（仍 3）",
+          int(config.RISK["wealth"]["max_n"]) == 3, str(config.RISK["wealth"]["max_n"]))
 
     print(f"\n{'-' * 60}\n通过 {PASS} 项，失败 {FAIL} 项")
     return 0 if FAIL == 0 else 1

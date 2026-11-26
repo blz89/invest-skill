@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""周度决策 + 模拟盘账本编排（**每周六 20:00 跑**；数据用交易日 19:00 本机统一取数产物，**决策日不重新取数**；2026-10-31 起周三已取消）。
+"""周度决策 + 模拟盘账本编排（**每周三、周六 20:30 跑**；数据用交易日 19:00 本机统一取数产物，**决策日不重新取数**）。
 
 它把三件事串起来：
   1. 拿到「本期目标组合」：决策日默认 `--reuse` 复用工作日已跑好的 out/ 产物（决策日不取数）；只有手工补跑/首次才跑三阶段管线（run.py）；
@@ -10,7 +10,7 @@
   # 首次建账（只建 state，不跑管线）
   python scripts/weekly.py --init --capital 50000 --tier B
 
-  # 决策日法（周六 20:00）：不取数，复用工作日已取产物
+  # 决策日法（周三/周六 20:30）：不取数，复用工作日已取产物
   python scripts/weekly.py --reuse --capital 50000 --tier B
 
   # 复用当天已经跑好的 out/ 产物（调试或补跑）
@@ -21,9 +21,9 @@
 
 设计约束：
   * 决策日 as_of = 今天之前（含）的最后一个交易日；最早成交日 fill_from = as_of 的下一个交易日。
-    这样「周六晚上看到周五收盘价 → 下周一卖出按开盘价 / 买入按限价条件单执行」，不存在用当天开盘价成交的未来函数。
+    这样「决策日晚上看到当日收盘价 → 次一交易日卖出按开盘价 / 买入按限价条件单执行」，不存在用当天开盘价成交的未来函数。
   * 决策日之后才可能成交，所以每一期都要先把上一期挂着的订单撮合掉，再生成新订单。
-  * 状态文件默认 LEDGER_DIR/state_50k.json（本部署 = <本技能目录>/ledger/state_50k.json；可用 --state 覆盖）；决策日收尾用 `--refresh-net` 刷新周报净利润（不取数、不动账本）。
+  * 状态文件默认 LEDGER_DIR/state_50k.json（本部署 = C:/Users/admin/.dsh/skills/invest/ledger/state_50k.json；可用 --state 覆盖）；决策日收尾用 `--refresh-net` 刷新周报净利润（不取数、不动账本）。
 """
 import argparse
 import datetime as dt
@@ -74,6 +74,14 @@ def next_trading_day(cal: list, day: str) -> str:
     if not after:
         raise RuntimeError(f"交易日历里找不到 {day} 之后的交易日（日历需要更新）")
     return after[0]
+
+
+def is_decision_weekday(day) -> bool:
+    """决策日 = 周三/周六（2026-11-25 起双决策 20:30）。"""
+    try:
+        return dt.date.fromisoformat(str(day)[:10]).weekday() in (2, 5)
+    except ValueError:
+        return False
 
 
 def weekday_cn(day: str) -> str:
@@ -266,15 +274,20 @@ def build_targets(plan: dict) -> list:
 
 
 def industry_cap_block(orders: list, state: dict, close_map: dict,
-                       cap_amount: float) -> tuple[list, list]:
+                       base_amount: float | None = None) -> tuple[list, list]:
     """行业上限硬拦截（#17）：买单不得把某个行业买到上限之上。
 
-    技能口径：单行业 ≤25%，分母是**权益层上限**（cap_amount），不是总资产；
+    技能口径（2026-11-26 用户拍板 A 方案）：单行业 ≤25%，分母是**本金**
+    （`meta.capital`），与 `plan.py` 的 `used_ind`（权重 × 本金）同一分母；
+    原来这里用「权益层上限」（防守档 17,500 元 → 25% = 4,375 元），比 plan 的
+    12,500 元严得多，导致 plan 算得进的个股买单在 weekly 被静默拦掉。
     只算股票层（个股 R3），ETF/债券层不占行业额度（与 plan 的分配口径一致）。
     现有持仓按市值、在挂买单按限价×股数计入名义额；未分类不占额度（另由
     巡检的「行业映射缺失」告警管）。返回 (保留的订单, 被拦下的订单)。
     """
-    cap = float(config.EXEC.get("max_industry") or 0.25) * float(cap_amount or 0.0)
+    base = float(base_amount if base_amount is not None
+                 else ((state.get("meta") or {}).get("capital") or 0.0))
+    cap = float(config.EXEC.get("max_industry") or 0.25) * base
     if not orders or cap <= 0:
         return list(orders or []), []
     mp = industry.load_map()
@@ -291,10 +304,18 @@ def industry_cap_block(orders: list, state: dict, close_map: dict,
         val = float(h.get("shares") or 0) * px
         ind = _ind(h.get("code"), h.get("industry"))
         used[ind] = used.get(ind, 0.0) + val
+    # 2026-11-26 修（A 类）：target_orders / cap_topup_orders 已经把本期新单登记进
+    # state["orders"]，这里再按挂单扫描会把「正在评估的新单」自己算一遍 → 行业额度
+    # 双重计数，凡是买到 12.5% 权益上限以上的个股买单都会被静默拦掉（实测：防守档
+    # 17,500 元权益、25% = 4,375 元，000999 2,221 元被算成 4,442 元而误拦，只剩 ETF）。
+    # 与 enforce_cash 的 exclude_ids 同一口径：只算「别的」挂单。
+    _evaluating_ids = {str(o.get("id")) for o in orders if o.get("id")}
     for o in state.get("orders") or []:
         if str(o.get("status") or "pending") != "pending" or o.get("action") != "buy":
             continue
         if str(o.get("kind") or "") != "stock":
+            continue
+        if str(o.get("id") or "") in _evaluating_ids:
             continue
         px = float(o.get("limit_price") or o.get("ref_price") or 0.0)
         ind = _ind(o.get("code"), o.get("industry"))
@@ -311,6 +332,15 @@ def industry_cap_block(orders: list, state: dict, close_map: dict,
         if ind != industry.UNCLASSIFIED and used.get(ind, 0.0) + amt > cap + 1e-6:
             blocked.append({**o, "blocked_industry": ind,
                             "industry_after": used.get(ind, 0.0) + amt})
+            # 2026-11-26 修（A 类）：被拦的买单已经由 target_orders 登记进账本，只从
+            # 渲染列表里剔掉会留下「报告说拦了、账本还挂着」的幽灵单（巡检会照旧撮合）。
+            # 这里就地取消（连带括号止损），让账本与周报一致。
+            if o.get("id") and isinstance(state.get("events"), list):
+                paper.cancel_order(
+                    state, o,
+                    f"行业 >{config.EXEC['max_industry']:.0%} 上限拦截：{ind} "
+                    f"已占 {used.get(ind, 0.0):,.0f} 元 + 本单 {amt:,.0f} 元 > "
+                    f"上限 {cap:,.0f} 元（本金 {base:,.0f} 元 × {config.EXEC['max_industry']:.0%}）")
             continue
         used[ind] = used.get(ind, 0.0) + amt
         kept.append(o)
@@ -606,6 +636,46 @@ def position_text(state: dict, pf: dict) -> str:
     return txt
 
 
+def week_skill_cost(ledger: str, as_of: str, days: int = 7) -> dict:
+    """上周技能花费（实扣）：budget.json runs 里 recorded_at ∈ [as_of-days+1, as_of] 的合计。
+
+    口径：只认已入账的 run（巡检/决策的窗口实结 task-window、周期结算 events-cycle、历史 flat），
+    按「记账日」落在周报同一区间（数据截止日 as_of 往前 days 天，含两端）求和。
+    开发会话/用户对话不记账，故不在这里出现。
+    返回 {"cost_cny", "runs", "since", "until", "items"}。
+    """
+    import billing as _B
+    end = dt.date.fromisoformat(str(as_of))
+    start = end - dt.timedelta(days=max(1, int(days)) - 1)
+    b = _B.budget_state(ledger)
+    items = []
+    total = 0.0
+    for r in (b.get("runs") or []):
+        day = str(r.get("recorded_at") or "")[:10]
+        try:
+            d = dt.date.fromisoformat(day)
+        except ValueError:
+            continue
+        if str(r.get("source") or "").lower() in ("test", "selftest"):
+            continue
+        if start <= d <= end:
+            cost = float(r.get("cost_cny") or 0.0)
+            total += cost
+            items.append({"date": day, "cost_cny": round(cost, 6),
+                          "source": r.get("source") or "", "note": r.get("note") or ""})
+    return {"cost_cny": round(total, 6), "runs": len(items),
+            "since": start.isoformat(), "until": end.isoformat(), "items": items}
+
+
+def skill_cost_row(skill_cost: dict) -> str:
+    """周报「上周技能花费（实扣）」表格行（无数据时给占位，不猜数）。"""
+    if not skill_cost:
+        return "| 上周技能花费（实扣） | —（budget.json 无该区间已入账 run） |"
+    return (f"| 上周技能花费（实扣） | {float(skill_cost.get('cost_cny') or 0):,.2f} 元"
+            f"（{int(skill_cost.get('runs') or 0)} 次运行；"
+            f"{skill_cost.get('since')}~{skill_cost.get('until')}） |")
+
+
 def weekly_md(state: dict, plan: dict, targets: list, as_of: str, fill_from: str,
               fills: list, new_orders: list, actions: list = None,
               label: str = "", mode: str = "", cash_yield: float = 0.0,
@@ -614,7 +684,7 @@ def weekly_md(state: dict, plan: dict, targets: list, as_of: str, fill_from: str
               repo: dict = None, decision_day: str = "",
               data_as_of: str = "", week: dict = None,
               navst: dict = None, cash_int: dict = None,
-              net: dict = None) -> str:
+              net: dict = None, skill_cost: dict = None) -> str:
     nav_before = state["nav"][-1]["nav"] if state.get("nav") else None
     base_cap = float(state["meta"]["capital"])
     inv = investable or {}
@@ -627,8 +697,8 @@ def weekly_md(state: dict, plan: dict, targets: list, as_of: str, fill_from: str
     fill_txt = (f"成交口径：决策日 {as_of} 收盘价（模拟盘）"
                 if fill_mode == "decision_close"
                 else f"最早成交日 {fill_from}（{weekday_cn(fill_from)}）")
-    dec_txt = (f"决策时点 {decision_day}（{weekday_cn(decision_day)}）20:00｜"
-               if decision_day and decision_day != as_of else "")
+    dec_txt = (f"决策时点 {decision_day}（{weekday_cn(decision_day)}）20:30｜"
+               if decision_day else "")
     data_txt = (f"数据截至 {data_as_of}（{weekday_cn(data_as_of)}）收盘"
                 if data_as_of else f"数据截至 {as_of}（{weekday_cn(as_of)}）收盘")
     stale_warn = ""
@@ -668,10 +738,14 @@ def weekly_md(state: dict, plan: dict, targets: list, as_of: str, fill_from: str
     out.append(f"| 最大回撤 / 仓位 | {(p.get('drawdown') or 0):+.2%} / {_pos:.1%} |")
     out.append(f"| 现金 | {p.get('cash', 0):,.2f} 元"
                f"（已落账利息 {_bk:+,.2f} + 在途 {_pd:+,.2f}） |")
+    if skill_cost is not None:
+        out.append(skill_cost_row(skill_cost))
     if net:
         out.append(f"| **净利润 / 净收益率** | **{net['net']:+,.2f} 元 / {net['rate']:+.2%}** |")
     out.append("")
-    out.append("> 口径：净利润 = 账户累计收益 − token 实扣（真实扣费，非年度计提）；周报不展开运行时费用；"
+    out.append("> 口径：净利润 = 账户累计收益 − token 实扣（真实扣费，非年度计提）；"
+               "「上周技能花费（实扣）」取自 budget.json 已入账 run 的 recorded_at 区间合计，"
+               "开发/对话不记账；"
                "评分 / 档位 / 奖励只在月报做（一周看不出能力），明细见月报 scorecard。")
     out.append("")
     try:
@@ -842,18 +916,20 @@ def otc_md(state: dict) -> str:
         return ""
     md = "\n\n## 场外债券基金（R2 层影子账）\n\n"
     md += ("场外按**金额法**记账：市值 = 投入金额 × (当日累计净值 / 买入日累计净值)；"
-           "申购按提交日的下一交易日累计净值成交、T+1 确认；赎回费按持有天数取实测档"
-           "（不足 90 天按最严档扣，满 90 天用基金披露的长期档）。\n\n")
+           "申购按提交日的下一交易日累计净值成交、T+1 确认；赎回费按**实际持有天数**查实测阶梯"
+           "（与选池 `otc.py` 用同一个估计函数）；只有费表取不到时才退回 1.5% 最严档假设"
+           "（下表「口径」列会写明是哪一种）。\n\n")
     if rows:
         md += ("| 代码 | 名称 | 等级 | 投入 | 市值 | 浮动 | 累计净值（买入→最新） "
-               "| 净值日 | 持有天数 | 赎回费率 |\n")
-        md += "|---|---|---|---|---|---|---|---|---|---|\n"
+               "| 净值日 | 持有天数 | 赎回费率 | 口径 |\n")
+        md += "|---|---|---|---|---|---|---|---|---|---|---|\n"
         for r in rows:
+            _assume = "假设" if "假设" in str(r.get("redeem_fee_basis") or "") else "实测"
             md += (f"| `{r['code']}` | {r['name']} | {r['level']} | {r['amount']:,.2f} | "
                    f"{r['value']:,.2f} | {r['unrealized']:+,.2f} "
                    f"({(r['unrealized_pct'] or 0):+.2%}) | "
                    f"{(r.get('acc_nav') or 0):.4f} → {(r.get('nav') or 0):.4f} | "
-                   f"{r['nav_date']} | {r['hold_days']} | {r['redeem_fee']:.2%} |\n")
+                   f"{r['nav_date']} | {r['hold_days']} | {r['redeem_fee']:.2%} | {_assume} |\n")
         md += (f"\n场外合计：投入 {otc_book.cost_total(state):,.2f} 元、"
                f"市值 {otc_book.market_value(state):,.2f} 元、"
                f"浮动 {otc_book.unrealized(state):+,.2f} 元、"
@@ -961,7 +1037,7 @@ def refresh_net(ledger, as_of, state, suffix=""):
             html = f.read()
         new_html = re.sub(r"｜净利润 [^｜<]*? 元（已扣[^）]*?）",
                           f"｜净利润 {net['net']:,.2f} 元（已扣运行时成本）", html)
-        _cls = "pos" if net["net"] > 0 else ("neg" if net["net"] < 0 else "")
+        _cls = "up" if net["net"] > 0 else ("down" if net["net"] < 0 else "")
         new_html = re.sub(r"<tr><th>净利润 / 净收益率</th><td class='num[^']*'>.*?</td></tr>",
                           f"<tr><th>净利润 / 净收益率</th><td class='num {_cls}'>"
                           f"{net['net']:,.2f} 元 / {net['rate']:+.2%}</td></tr>", new_html)
@@ -973,6 +1049,24 @@ def refresh_net(ledger, as_of, state, suffix=""):
     print(f"[weekly] --refresh-net：净利润 {net['net']:+,.2f} 元（{net['rate']:+.2%}）")
     print(f"[weekly]   已刷新：{', '.join(changed) if changed else '无文件变化（本期周报可能尚未生成）'}")
     return 0
+
+
+def plan_date_guard(data_as_of: str, as_of: str, backfill: bool) -> str:
+    """stage3_plan.json 的数据日与本次决策日不一致时返回错误说明（否则 ""）。
+
+    A5：`--reuse` 复用的是「当下跑好的 out/ 产物」，回填历史决策日若直接用现在的
+    stage3_plan.json，就是把未来信息写进历史账本（未来函数）。这里做硬闸门。
+    """
+    if not data_as_of or data_as_of == as_of:
+        return ""
+    if backfill:
+        return (f"stage3_plan.json 的 data_as_of={data_as_of} 与回填决策日 {as_of} 不一致："
+                "回填必须用当时产出的产物，否则会把未来数据写进历史账本")
+    if data_as_of > as_of:
+        return (f"stage3_plan.json 数据日 {data_as_of} 晚于决策日 {as_of}（疑似用未来数据）："
+                "决策日不取数，请用当日 19:00 取数后的产物")
+    return (f"stage3_plan.json 的 data_as_of={data_as_of} 落后于决策日 {as_of}："
+            "决策日不重新取数，请先确认当日取数与阶段管线已按新数据跑完再决策")
 
 
 def capital_match(plan_cap, invest: float, base: float) -> tuple:
@@ -1009,12 +1103,16 @@ def main(argv=None):
     ap.add_argument("--date", default=None,
                     help="决策日（默认今天；补跑/维护时用它把决策时点固定到真实决策日，否则周报会记成今天）")
     ap.add_argument("--reuse", action="store_true",
-                    help="复用已跑好的 out/ 产物，不重跑管线（决策日周六 20:00 必须加：决策日不取数）")
+                    help="复用已跑好的 out/ 产物，不重跑管线（决策日（周三/周六）20:30 必须加：决策日不取数）")
+    ap.add_argument("--allow-refetch", action="store_true", dest="allow_refetch",
+                    help="决策日也允许重跑管线/取数（默认禁止；仅手工补数调试时用）")
     ap.add_argument("--limit", type=int, default=None, help="只取前 N 只（调试）")
     ap.add_argument("--init", action="store_true", help="只建账不跑管线")
     ap.add_argument("--refresh-net", action="store_true",
                     help="决策日收尾：T8/计费结算后刷新周报 md+HTML 的 token 实花/净利润/档位三行"
                          "（不重跑管线、不取数、不动账本）")
+    ap.add_argument("--allow-replay", action="store_true", dest="allow_replay",
+                    help="允许 --date 回填「账本已有更晚净值点」的历史日（默认拒绝，防未来函数）")
     args = ap.parse_args(argv)
 
     led_cfg = (CFG.get("ledgers") or {}).get(args.ledger) or {}
@@ -1036,8 +1134,8 @@ def main(argv=None):
 
     cal = load_calendar()
     day = args.date or today_str()
-    if not args.date and weekday_cn(day) != "周六":
-        print(f"[weekly] ⚠ 今天不是决策日（{weekday_cn(day)}，决策日固定周六 20:00）："
+    if not args.date and not is_decision_weekday(day):
+        print(f"[weekly] ⚠ 今天不是决策日（{weekday_cn(day)}，决策日固定周三、周六 20:30）："
               f"周报「决策时点」会记成 {day}。补跑/维护请加 --date <决策日 YYYY-MM-DD>，避免报表落错日期。")
     as_of = last_trading_day(cal, day)
     fill_from = next_trading_day(cal, as_of)
@@ -1075,14 +1173,26 @@ def main(argv=None):
     if args.reuse:
         print("[weekly] --reuse：直接复用 out/ 里的阶段结果")
     else:
-        if dt.date.fromisoformat(day).weekday() == 5:
-            print("[weekly] ⚠️ 今天是周六（决策日）却未加 --reuse：会重新跑管线/取数。"
-                  "决策日口径要求不取数，建议改用 --reuse；本次仍继续执行。")
+        if is_decision_weekday(day) and not args.allow_refetch:
+            raise SystemExit("[weekly] 决策日必须加 --reuse（决策日不取数）；"
+                             "如确需重跑管线/取数，加 --allow-refetch 显式确认。")
         run_pipeline(invest, args.tier, args.override_regime, args.limit)
 
     plan = load_plan()
     plan_cap = plan.get("capital")
     data_as_of = str(plan.get("data_as_of") or "")
+    _guard = plan_date_guard(data_as_of, as_of, bool(args.date))
+    if _guard:
+        raise SystemExit("[weekly] " + _guard)
+    if args.reuse and not data_as_of:
+        print("[weekly] ⚠ stage3_plan.json 没有 data_as_of 字段（旧产物），无法校验数据日")
+    if args.date:
+        _later = [str(r.get("date") or "") for r in (state.get("nav") or [])
+                  if str(r.get("date") or "") > as_of]
+        if _later and not args.allow_replay:
+            raise SystemExit(f"[weekly] 账本已有 {as_of} 之后（{_later[-1]}）的净值点："
+                             "拒绝回填历史日（会把未来信息写进历史账本）；"
+                             "如确需重放请加 --allow-replay")
     base_cap = float((state.get("meta") or {}).get("capital") or 0.0)
     cap_ok, cap_note = capital_match(plan_cap, invest, base_cap)
     if cap_note:
@@ -1259,11 +1369,10 @@ def main(argv=None):
                                          mode=eff_mode, bad_codes=bad_codes,
                                          month_trades=paper.month_trade_count(state, as_of))
     # 行业上限硬拦截（#17）：只拦买单，止损/清仓/减仓单不受影响；
-    # 分母用本周权益上限（cap_amount），与技能「单行业 ≤25%（权益层）」一致。
+    # 分母用**本金**（2026-11-26 用户拍板 A 方案），与 plan.py 的 used_ind 同口径。
     if new_orders:
-        _cap_amt = float((plan.get("tier") or {}).get("equity_amount") or 0) \
-            or float(plan.get("target_gross") or 0) * invest
-        new_orders, _ind_blocked = industry_cap_block(new_orders, state, close_map, _cap_amt)
+        _base_amt = float((state.get("meta") or {}).get("capital") or 0.0) or invest
+        new_orders, _ind_blocked = industry_cap_block(new_orders, state, close_map, _base_amt)
         if _ind_blocked:
             _desc = "；".join(f"{o.get('name') or o['code']}（{o['blocked_industry']}"
                              f" → {o['industry_after']:,.0f} 元）" for o in _ind_blocked)
@@ -1363,7 +1472,7 @@ def main(argv=None):
     # regime_change 的判定依据：本期市场状态存进账本，下期比对其是否变化。
     state["meta"]["last_regime"] = cur_regime
     # 权益上限也存一份：现金层要按「权益上限 − 现有权益」
-    # 留出建仓弹药，钱必须周一就在券商账户（周六决策、场外货基周末不能赎回）。
+    # 留出建仓弹药，钱必须周一就在券商账户（决策日下单、次一交易日开盘成交；场外货基赎回 T+1）。
     if cap_amount > 0:
         state["meta"]["equity_cap"] = round(float(cap_amount), 2)
     paper.save(state, args.state)
@@ -1381,8 +1490,14 @@ def main(argv=None):
         import housekeeping as HK
         _d = dt.date.fromisoformat(as_of)
         _mon = (_d - dt.timedelta(days=_d.weekday())).isoformat()
-        _fri = (dt.date.fromisoformat(_mon) + dt.timedelta(days=4)).isoformat()
-        week = HK.week_digest(_mon, _fri)
+        _start = _mon
+        _prev = str(prev_period or "")[:10]
+        if _prev:
+            try:
+                _start = max(_mon, (dt.date.fromisoformat(_prev) + dt.timedelta(days=1)).isoformat())
+            except ValueError:
+                _start = _mon
+        week = HK.week_digest(_start, as_of)  # 覆盖到决策日为止，不把未来日期算进来
     except Exception as exc:                        # noqa: BLE001 - 汇总失败不能拖垮周报
         print(f"[weekly] 本周巡检汇总生成失败（{exc}），其余照常")
 
@@ -1413,12 +1528,19 @@ def main(argv=None):
     except Exception as exc:                        # noqa: BLE001
         print(f"[weekly] 净利润口径计算失败（{exc}），周报仍出但缺该行")
 
+    # 上周技能花费（实扣）：budget.json 已入账 run 的 recorded_at ∈ [as_of-6, as_of] 合计。
+    # 只展示事实，不参与任何规则/阈值判断。
+    _skill_cost = None
+    try:
+        _skill_cost = week_skill_cost(args.ledger, as_of)
+    except Exception as exc:                        # noqa: BLE001
+        print(f"[weekly] 技能花费统计失败（{exc}），该行缺省")
     md = weekly_md(state, plan, targets, as_of, fill_from, period_trades, new_orders,
                    actions=actions, label=label, mode=mode, cash_yield=yield_amt, repo=repo,
                    changes=changes, investable=inv,
                    fill_mode=fill_mode, filled_now=filled_now,
                    decision_day=day, data_as_of=data_as_of, week=week, navst=navst,
-                   cash_int=cash_int, net=net)
+                   cash_int=cash_int, net=net, skill_cost=_skill_cost)
     # 收益拆解（权益 / 场外 R2 / 现金三层）：2026-11-08周报固定体现三层结构
     try:
         import breakdown as BD
@@ -1502,7 +1624,7 @@ def main(argv=None):
               f"{sys.executable} {os.path.join(HERE, 'paper_exec.py')} --ledger {args.ledger} --date <交易日>")
     else:
         print(f"[weekly] 成交口径：卖出按下一交易日开盘价、买入按限价条件单（{fill_from}）。不需要人工操作，"
-              f"成交会在下一次决策时按订单类型自动撮合落账。")
+              f"每日 20:00 巡检会话的 paper_exec.py 会按订单类型撮合落账（未触发继续挂）。")
         print(f"[weekly] 想提前看某天的成交，可补跑："
               f"{sys.executable} {os.path.join(HERE, 'paper_exec.py')} --ledger {args.ledger} --date {fill_from}")
     print(f"[weekly] 账本：{args.state}")

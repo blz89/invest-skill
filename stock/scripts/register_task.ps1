@@ -2,7 +2,7 @@
 (Re-)register the Windows scheduled task that fetches tonight's data in one go.
 
     DSH-DailyPatrol  ->  powershell.exe -NoProfile -ExecutionPolicy Bypass `
-                           -File "%USERPROFILE%\.dsh\skills\invest\stock\scripts\daily_patrol.ps1" -Ledger 50k
+                           -File "D:\skills\invest\stock\scripts\daily_patrol.ps1" -Ledger 50k
 
 daily_patrol.ps1 already runs everything in one shot:
     prefetch (python -m stock prefetch)  ->  invest_data  ->  prune
@@ -10,9 +10,9 @@ so the task definition never changes when the steps change; only this script or 
 timeout in the task settings needs touching.
 
 Usage (an elevated prompt is required when registering with -RunLevel Highest):
-    powershell -NoProfile -ExecutionPolicy Bypass -File %USERPROFILE%\.dsh\skills\invest\stock\scripts\register_task.ps1 -DryRun
-    powershell -NoProfile -ExecutionPolicy Bypass -File %USERPROFILE%\.dsh\skills\invest\stock\scripts\register_task.ps1 -Time 19:00 -ExecutionHours 3
-    powershell -NoProfile -ExecutionPolicy Bypass -File %USERPROFILE%\.dsh\skills\invest\stock\scripts\register_task.ps1 -Remove
+    powershell -NoProfile -ExecutionPolicy Bypass -File D:\skills\invest\stock\scripts\register_task.ps1 -DryRun
+    powershell -NoProfile -ExecutionPolicy Bypass -File D:\skills\invest\stock\scripts\register_task.ps1 -Time 19:00 -ExecutionHours 3
+    powershell -NoProfile -ExecutionPolicy Bypass -File D:\skills\invest\stock\scripts\register_task.ps1 -Remove
 
 Defaults match the current production task: Mon-Fri 19:00, ExecutionTimeLimit PT3H,
 StartWhenAvailable, MultipleInstances=IgnoreNew, run as the current user (highest).

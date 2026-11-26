@@ -246,6 +246,32 @@ def main():
         config.OUT_DIR = old_out
         shutil.rmtree(tmp_out, ignore_errors=True)
 
+    print("=== 4b. 决策日（周三/周六）：数据落后在每次决策日都必须 NO-GO ===")
+    tmp_d = tempfile.mkdtemp(prefix="doctor_decday_")
+    old_out2 = config.OUT_DIR
+    old_today = doctor.TODAY
+    old_ltd = doctor.last_trading_day
+    try:
+        with open(os.path.join(tmp_d, "stage3_plan.json"), "w", encoding="utf-8") as f:
+            json.dump({"capital": 50000.0, "generated_at": "2026-11-20T21:00:00",
+                       "data_as_of": "2026-11-20", "tier": {"equity_amount": 3500},
+                       "market_regime": {"regime": "防守"}}, f)
+        config.OUT_DIR = tmp_d
+        doctor.last_trading_day = lambda: "2026-11-24"
+        for day, label, want in (("2026-11-25", "周三决策日", "ERROR"),
+                                 ("2026-11-28", "周六决策日", "ERROR"),
+                                 ("2026-11-26", "周四非决策日", "WARN")):
+            doctor.TODAY = day
+            rep = doctor.Report()
+            doctor.check_plan(rep, "50k", {"capital": 50000.0}, base_state(capital=50000.0))
+            got = [r["level"] for r in rep.items if "数据日期" in r["name"]]
+            check(f"{label}：数据落后 → {want}", want in got, str(got))
+    finally:
+        doctor.TODAY = old_today
+        doctor.last_trading_day = old_ltd
+        config.OUT_DIR = old_out2
+        shutil.rmtree(tmp_d, ignore_errors=True)
+
     print("=== 5. 缺账本文件只算 WARN（首次建账不该被拦） ===")
     rep = doctor.Report()
     cfg = {"capital": 10000.0, "tier": "B",
@@ -333,6 +359,25 @@ def main():
 
     print("=== 8. 产物自检（行业覆盖 / 社融停更） ===")
     test_products()
+
+    # === 9. 动态本金（代码审计 A10） ===
+    print("=== 9. 动态本金下的本金/基线校验 ===")
+    _s10 = base_state(55000.0)
+    _s10["meta"]["initial_capital"] = 50000.0
+    _s10["meta"]["capital_history"] = [{"month": "2026-12", "date": "2026-12-01",
+                                       "injection": 5000.0, "capital": 55000.0}]
+    _s10["nav"][0]["bench_nav"] = 50000.0
+    _s10["nav"][0]["nav"] = 50000.0
+    _s10["nav"][0]["cash"] = 49000.0
+    _s10["cash"] = 49000.0
+    _p10 = doctor.nav_baseline_problems(_s10)
+    check("A10 动态本金下基线校验用初始本金（首点 50,000 不误报）", not _p10, str(_p10))
+    _s10b = copy.deepcopy(_s10)
+    _s10b["meta"].pop("initial_capital", None)
+    _s10b["meta"].pop("capital_history", None)
+    _p10b = doctor.nav_baseline_problems(_s10b)
+    check("A10 无注资记录的账本仍严格（55,000 vs 50,000 必须报）",
+          any("50,000" in str(x) for x in _p10b) or bool(_p10b), str(_p10b))
 
     print()
     print(f"断言：{PASS + FAIL} 项｜通过 {PASS}｜失败 {FAIL}")

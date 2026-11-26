@@ -5,6 +5,9 @@
 """
 from __future__ import annotations
 
+import atexit
+import datetime
+import shutil
 import os
 import sys
 import tempfile
@@ -12,9 +15,12 @@ import tempfile
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
+import capital_dyn  # noqa: E402
+import config  # noqa: E402
 import monthly  # noqa: E402
 import paper  # noqa: E402
 import report_html  # noqa: E402
+import score  # noqa: E402
 import team  # noqa: E402
 
 N = [0]
@@ -64,6 +70,7 @@ check("空文本 → 空", monthly._grab_section("", ("策略复盘",)) == "")
 
 print("2) read_retro：从文件摘两节")
 tmp = tempfile.mkdtemp(prefix="selftest_monthly_")
+atexit.register(shutil.rmtree, tmp, ignore_errors=True)
 p = os.path.join(tmp, "retro.md")
 with open(p, "w", encoding="utf-8") as f:
     f.write(RETRO)
@@ -161,17 +168,22 @@ check("md 年度计划子标题降级", "\n### 1. 年度目标\n" in md_ap and "
 check("缺 annual_plan → 写无年度计划", "本年度无年度计划" in md2)
 check("md 下月计划顺延为八", "## 八、下月计划" in md2)
 
-print("6) build_monthly_report：HTML 第一、二节可见")
+print("6) build_monthly_report：HTML 简单版主区 + 明细折叠")
 html = report_html.build_monthly_report(month="2026-10", data=data)
-check("HTML 含一、上月策略复盘与改进", "一、上月策略复盘与改进" in html)
+check("HTML 含上月策略复盘节", "上月策略复盘与改进" in html)
 check("HTML 摘入复盘文本", "证据A" in html)
-check("HTML 含二、技能优化", "二、技能优化（A 类已执行 / B 类待拍板）" in html)
+check("HTML 含技能优化节", "技能优化（A 类已执行 / B 类待拍板）" in html)
 check("HTML 含完成度 1/2", "清单完成度：1/2" in html)
 check("HTML 含自动诊断信号", "测试告警" in html)
-check("HTML 含三、数据统计", "三、数据统计" in html)
 html2 = report_html.build_monthly_report(month="2026-10", data=data2)
+check("HTML 含本月做了什么节", "这个月做了什么" in html2)
 check("HTML 有月度收益", "月度收益" in html2)
 check("HTML 有总收益（累计）", "总收益（累计" in html2)
+check("HTML 明细折叠为 details 结构", html2.count("<details>") >= 1 and "</details>" in html2)
+check("HTML 主区四节齐全", all(k in html2 for k in ("① 这个月赚了没", "② 这个月做了什么",
+                                                     "③ 记分卡判定", "④ 下月什么条件动手")))
+_no = report_html.build_monthly_report(month="2026-10", data={"ledgers": {"50k": {"label": "主", "month": {"no_data": True}}}})
+check("空月份给缺数据提示、不渲染 0.00%", "不渲染虚假的 0.00%" in _no and "这个月赚了没" not in _no)
 htmlv = report_html.build_monthly_report(month="2026-10", data=data_v)
 check("HTML 含策略可行性判定标题", "策略可行性判定（五问）" in htmlv)
 check("HTML 摘入 viability 正文", "结论：继续" in htmlv)
@@ -265,6 +277,241 @@ try:
     check("按自然年求和", abs(monthly._year_token_spent("50k", 2026) - 2.0) < 1e-9)
 finally:
     _billing_mod.budget_state = _orig_bs
+
+print("10) 月报累计收益取「月末净值」而非当前净值")
+_st = {
+    "meta": {"capital": 50000.0},
+    "cash": 50500.0,
+    "nav": [
+        {"date": "2026-10-15", "nav": 50000.0, "cash": 50000.0, "bench_nav": 50000.0},
+        {"date": "2026-10-31", "nav": 50500.0, "cash": 50500.0, "bench_nav": 50000.0},
+        {"date": "2026-11-10", "nav": 51000.0, "cash": 51000.0, "bench_nav": 50000.0},
+    ],
+    "cash_marks": {}, "events": [], "holdings": {}, "orders": [],
+    "trades": [], "otc_holdings": {}, "repo_history": [], "repo_open": {},
+}
+_mm = monthly.month_metrics(_st, "2026-10", ledger="50k")
+check(f"nav_end 取月末点 50500（实际 {_mm.get('nav_end')}）",
+      abs(float(_mm.get("nav_end") or 0) - 50500.0) < 1e-9)
+check(f"total_return 用月末净值（实际 {_mm.get('total_return')}）",
+      abs(float(_mm.get("total_return") or 0) - (50500.0 / 50000.0 - 1.0)) < 1e-9)
+
+print("11) 动态本金（月注资 5,000 / 月等价年化 / token 从现金出账）")
+_cfg = (config.PERF or {}).get("dynamic_capital") or {}
+check("config.PERF.dynamic_capital 存在", bool(_cfg))
+check("每月注资 5,000 元", abs(float(_cfg.get("monthly_injection_cny") or 0) - 5000.0) < 1e-9)
+check("起始月 2026-12", str(_cfg.get("start_month")) == "2026-12")
+check("token 从账户现金扣", bool(_cfg.get("token_from_cash")))
+check("年报定档口径 = monthly_mean_equiv",
+      str(_cfg.get("annual_grade_metric")) == "monthly_mean_equiv")
+
+_nav = [
+    {"date": "2026-11-04", "nav": 50000.0, "cash": 50000.0},
+    {"date": "2026-11-15", "nav": 50200.0, "cash": 50200.0},
+    {"date": "2026-11-29", "nav": 50500.0, "cash": 50500.0},
+    {"date": "2026-12-01", "nav": 50500.0, "cash": 50500.0},
+    {"date": "2026-12-31", "nav": 51000.0, "cash": 51000.0},
+]
+_ser = monthly.score.monthly_equivs(_nav) if hasattr(monthly, "score") else None
+if _ser is None:
+    import score as _scmod
+    _ser = _scmod.monthly_equivs(_nav)
+check(f"按月切窗 2 个月（实际 {len(_ser)}）", len(_ser) == 2)
+_n11, _n12 = _ser[0], _ser[1]
+check(f"11 月月收益率 1%（实际 {_n11['r']:.6f}）", abs(_n11["r"] - 0.01) < 1e-9)
+check(f"11 月实际运行天数 25（实际 {_n11['days']}）", _n11["days"] == 25)
+_exp11 = (1.01 ** (365.0 / 25.0)) - 1
+check(f"11 月等价年化按 25 天折（实际 {_n11['equiv']:.6f} vs 期望 {_exp11:.6f}）",
+      abs(_n11["equiv"] - _exp11) < 1e-6)
+check("12 月月收益率 500/50500", abs(_n12["r"] - (51000.0 / 50500.0 - 1.0)) < 1e-9)
+import score as _sc
+_mean = _sc.monthly_mean_equiv(_ser)
+check(f"各月等价年化算术平均（实际 {_mean:.6f}）",
+      abs(_mean - (_n11["equiv"] + _n12["equiv"]) / 2.0) < 1e-9)
+
+import billing as _bm
+_orig_bs = _bm.budget_state
+try:
+    _bm.budget_state = lambda ledger, cap: {"runs": [
+        {"ended_at": "2026-11-20T10:00:00", "cost_cny": 1.5},
+        {"ended_at": "2026-12-02T10:00:00", "cost_cny": 0.9},
+        {"started_at": "2026-11-30T10:00:00", "cost_cny": 0.1}]}
+    check("token_spent_in 只汇总该月 runs",
+          abs(capital_dyn.token_spent_in("50k", "2026-11") - 1.6) < 1e-9)
+    _st = {"meta": {"capital": 50000.0}, "cash": 50500.0,
+           "nav": [dict(x) for x in _nav[:3]], "events": []}
+    _tk = capital_dyn.book_token(_st, "50k", "2026-11", as_of="2026-12-01")
+    check(f"token 出账 1.6 元（实际 {_tk.get('amount')}）", abs(float(_tk.get("amount") or 0) - 1.6) < 1e-9)
+    check("现金同步减少", abs(float(_st["cash"]) - (50500.0 - 1.6)) < 1e-9)
+    check("当月最后净值点同步改成净口径",
+          abs(float(_st["nav"][-1]["nav"]) - (50500.0 - 1.6)) < 1e-9)
+    check("记 token_cost 事件", any(e.get("level") == "token_cost" for e in _st["events"]))
+    _tk2 = capital_dyn.book_token(_st, "50k", "2026-11", as_of="2026-12-01")
+    check("token 出账幂等（第二次 already）", bool(_tk2.get("already")) and abs(float(_st["cash"]) - (50500.0 - 1.6)) < 1e-9)
+finally:
+    _bm.budget_state = _orig_bs
+
+_inj = capital_dyn.inject(_st, "2026-12", as_of="2026-12-01")
+check(f"注资 5,000 元（实际 {_inj.get('injection')}）", abs(float(_inj.get("injection") or 0) - 5000.0) < 1e-9)
+check(f"新本金 = 上月末净值(净口径) + 5,000（实际 {_st['meta']['capital']}）",
+      abs(float(_st["meta"]["capital"]) - (50500.0 - 1.6 + 5000.0)) < 1e-9)
+check("现金同步加 5,000", abs(float(_st["cash"]) - (50500.0 - 1.6 + 5000.0)) < 1e-9)
+check("记 capital_injection 事件", any(e.get("level") == "capital_injection" for e in _st["events"]))
+check("本金历史留痕 1 条", len(_st["meta"].get("capital_history") or []) == 1)
+_inj2 = capital_dyn.inject(_st, "2026-12", as_of="2026-12-01")
+check("注资幂等（第二次 already）",
+      bool(_inj2.get("already")) and abs(float(_st["cash"]) - (50500.0 - 1.6 + 5000.0)) < 1e-9)
+
+_early = capital_dyn.inject({"meta": {"capital": 50000.0}, "cash": 50000.0, "nav": [], "events": []}, "2026-11")
+check("起始月之前不注资", bool(_early.get("skipped")))
+check("prev_month 跨年正确", capital_dyn.prev_month("2026-01") == "2025-12")
+check("last_day 12 月 = 12-31", capital_dyn.last_day("2026-12") == "2026-12-31")
+
+_st2 = {"meta": {"capital": 55000.0}, "cash": 55000.0,
+        "nav": [dict(x) for x in _nav[:3]], "events": [], "holdings": {}, "orders": [],
+        "trades": [], "otc_holdings": {}, "cash_marks": {}, "repo_history": [],
+        "repo_open": {}, "sleeve_lots": []}
+_mm2 = monthly.month_metrics(_st2, "2026-11", ledger="50k")
+check("月报识别 token 已在净值中（net.token_in_nav）", bool((_mm2.get("net") or {}).get("token_in_nav")))
+check("token 已出账后不再二次扣（net.token_cost = 0）",
+      abs(float((_mm2.get("net") or {}).get("token_cost") or 0.0)) < 1e-9)
+check("月报返回 dynamic 摘要", bool(_mm2.get("dynamic")))
+
+_y_nav = [{"date": "2025-12-05", "nav": 50000.0, "cash": 50000.0},
+          {"date": "2025-12-31", "nav": 50050.0, "cash": 50050.0}]
+for _k in range(12):
+    _mm = f"2026-{_k + 1:02d}"
+    _b = 50000.0 + _k * 100
+    _y_nav.append({"date": f"{_mm}-05", "nav": _b, "cash": _b})
+    _y_nav.append({"date": f"{_mm}-28", "nav": _b + 20.0, "cash": _b + 20.0})
+_y_st = {"meta": {"capital": 50000.0}, "cash": 50000.0, "nav": _y_nav, "events": []}
+_yr = capital_dyn.year_mean_equiv(_y_st, 2026)
+check(f"本年只取 2026 的 12 个月（实际 {_yr['months']}）", _yr["months"] == 12)
+_exp_vals = []
+for _k in range(12):
+    # A1：月窗口起点 = 上一个月最后一个净值点（注资在月初到账，不能算成当月涨幅）。
+    _end = 50000.0 + _k * 100 + 20.0
+    _base = 50050.0 if _k == 0 else (50000.0 + (_k - 1) * 100 + 20.0)
+    _d0 = datetime.date(2025, 12, 31) if _k == 0 else datetime.date(2026, _k, 28)
+    _d1 = datetime.date(2026, _k + 1, 28)
+    _r = _end / _base - 1.0
+    _exp_vals.append((1.0 + _r) ** (365.0 / max((_d1 - _d0).days, 1)) - 1.0)
+_exp_avg = sum(_exp_vals) / 12.0
+check(f"本年平均 = 12 个月算术平均（实际 {_yr['value']:.6f} vs 期望 {_exp_avg:.6f}）",
+      abs(float(_yr["value"]) - _exp_avg) < 1e-9)
+_avg_all = capital_dyn.mean_equiv(_y_st)
+check("全部累计平均与本年不同（2025-12 只作参考、不进年报定档）",
+      abs(float(_avg_all) - _exp_avg) > 1e-6)
+check("grade_year：末月是 12 月 → 2026", capital_dyn.grade_year(_y_st) == 2026)
+check("grade_year：末月非 12 月也取数据所在年（中途重渲）",
+      capital_dyn.grade_year({"nav": [{"date": "2026-11-25", "nav": 1.0},
+                                      {"date": "2026-11-26", "nav": 1.0}]}) == 2026)
+check(f"本年没有算不出的月份（{_yr[chr(34)+chr(39)+chr(34)] if False else _yr['missing']}）", _yr["missing"] == [])
+
+_m_st = {"meta": {}, "cash": 50000.0, "nav": [
+    {"date": "2026-01-05", "nav": 50000.0}, {"date": "2026-01-28", "nav": 50010.0},
+    {"date": "2026-02-10", "nav": 50020.0}], "events": []}
+_ym = capital_dyn.year_mean_equiv(_m_st, 2026)
+# A1 之后：月初注资记在当月，月窗口起点取「上月最后一个净值点」，
+# 所以本月只有 1 个净值点也能算出等价年化（不再进 missing）。
+check(f"单点月份也算出等价年化（起点=上月最后一点）（实际 missing={_ym['missing']}）",
+      _ym["missing"] == [])
+_ym_exp = (((1.0002) ** (365.0 / 23.0) - 1.0)
+           + ((50020.0 / 50010.0) ** (365.0 / 13.0) - 1.0)) / 2.0
+check(f"平均 = 两个有效月算术平均（实际 {_ym['value']:.6f} vs {_ym_exp:.6f}）",
+      abs(float(_ym["value"]) - _ym_exp) < 1e-9)
+
+_sm = capital_dyn.summary(_y_st, "2026-12")
+check("summary 带本年字段（year/year_months）", _sm["year"] == 2026 and _sm["year_months"] == 12)
+check("summary 本年平均 == year_mean_equiv",
+      abs(float(_sm["year_mean_equiv"]) - float(_yr["value"])) < 1e-12)
+_src = open(os.path.join(os.path.dirname(os.path.abspath(monthly.__file__)), "team.py"),
+            encoding="utf-8").read()
+check("team.py 年报用 year_mean_equiv + grade_year 定档",
+      "year_mean_equiv" in _src and "grade_year" in _src)
+
+# ---------------- 12) 代码审计 2026-11-26 A 类回归 ----------------
+print("\n12) 代码审计 A 类回归")
+_reg = {"meta": {"capital": 50000.0, "initial_capital": 50000.0}, "cash": 50000.0,
+        "nav": [{"date": "2026-11-28", "nav": 50000.0, "cash": 50000.0}], "events": []}
+capital_dyn.inject(_reg, "2026-12", as_of="2026-12-01")
+check("A1 注资只加现金、不写净值点",
+      abs(float(_reg["cash"]) - 55000.0) < 1e-9
+      and abs(float(_reg["nav"][-1]["nav"]) - 50000.0) < 1e-9)
+check("A1 本金 = 上月末净值 + 注资", abs(float(_reg["meta"]["capital"]) - 55000.0) < 1e-9)
+check("A1 注资留痕带日期", bool((_reg["meta"].get("capital_history") or [{}])[0].get("date")))
+_nv = [{"date": "2026-11-30", "nav": 50500.0}, {"date": "2026-12-31", "nav": 56000.0}]
+_me = [x for x in score.monthly_equivs(_nv, flows=[{"date": "2026-12-01", "amount": 5000.0}])
+       if x["month"] == "2026-12"][0]
+check(f"A1 月收益剔除注资（实际 {_me['r']:.6f} 应 ≈ +0.009901）",
+      abs(float(_me["r"]) - 500.0 / 50500.0) < 1e-9)
+check("A1 单点月份也能算等价年化", _me["equiv"] is not None and _me["days"] == 31)
+
+check("A2 累计投入 = 初始 + Σ注资", abs(capital_dyn.contributed_capital(_reg) - 55000.0) < 1e-9)
+_cum = capital_dyn.cumulative(_reg)
+check(f"A2 累计盈亏 = 净值 − 累计投入（实际 {_cum['pnl']}）",
+      abs(float(_cum["pnl"]) - (50000.0 - 55000.0)) < 1e-9)
+
+# A3：年度奖励划出后 nav / cash / meta.capital 三方一致
+_a3 = {"meta": {"capital": 51000.0}, "cash": 51000.0,
+       "nav": [{"date": "2026-11-01", "nav": 50000.0, "cash": 50000.0},
+               {"date": "2026-12-31", "nav": 51000.0, "cash": 51000.0}],
+       "events": [], "holdings": {}, "trades": [], "orders": []}
+_m3 = {"nav_start": 50000.0, "nav_end": 51000.0, "ret_year": 0.02, "pnl_year": 1000.0,
+       "net": {"net_profit": 800.0, "net_rate": 0.016, "net_rate_ann": 0.016, "grade": "B-",
+               "reward_cny": 500.0, "reward_pending": False}}
+_tmp = os.path.join(tempfile.mkdtemp(prefix="a3_"), "state.json")
+paper.save(_a3, _tmp)
+try:
+    monthly.settle_year(_a3, 2026, _m3, _tmp, ledger="50k", as_of="2027-01-01")
+finally:
+    shutil.rmtree(os.path.dirname(_tmp), ignore_errors=True)
+check("A3 奖励划出后 cash == 末根 nav == 本金",
+      abs(float(_a3["cash"]) - float(_a3["nav"][-1]["nav"])) < 1e-6
+      and abs(float(_a3["nav"][-1]["nav"]) - float(_a3["meta"]["capital"])) < 1e-6)
+
+# A4：年报不再对 token 二次扣（nav 已是净口径）
+_a4 = {"meta": {"capital": 100000.0}, "cash": 100100.0,
+       "nav": [{"date": "2026-01-02", "nav": 100000.0, "cash": 100000.0},
+               {"date": "2026-12-31", "nav": 100100.0, "cash": 100100.0}],
+       "events": [], "holdings": {}, "trades": [], "orders": []}
+_ym4 = monthly.year_metrics(_a4, 2026, ledger="50k")
+check("A4 年报净利 = 毛利（token 只展示、不二次扣）",
+      abs(float(_ym4["net"]["net_profit"]) - float(_ym4["pnl_year"])) < 1e-6)
+
+# A5：token 已从现金扣（token_from_cash）时，季/多窗口不能再减一次
+_w5 = score.windows_from_nav(
+    [{"date": "2026-10-01", "nav": 100000.0}, {"date": "2026-12-31", "nav": 100000.0}],
+    as_of="2026-12-31", capital=100000.0,
+    runs=[{"cost_cny": 37.5, "ended_at": "2026-11-01 10:00:00", "run_id": "w5"}],
+    token_in_nav=True)["quarter"]
+_w5b = score.windows_from_nav(
+    [{"date": "2026-10-01", "nav": 100000.0}, {"date": "2026-12-31", "nav": 100000.0}],
+    as_of="2026-12-31", capital=100000.0,
+    runs=[{"cost_cny": 37.5, "ended_at": "2026-11-01 10:00:00", "run_id": "w5"}])["quarter"]
+check("A5 token_in_nav 时季窗口不再二次扣（net = gross、费率 0）",
+      abs(float(_w5["net_return"]) - float(_w5["gross_return"])) < 1e-12
+      and abs(float(_w5["token_cost_rate"])) < 1e-12)
+check("A5 未声明 token_in_nav 时仍按旧口径扣（保证向后兼容）",
+      float(_w5b["net_return"]) < float(_w5b["gross_return"]))
+
+# A8：无 token 记录的月份不能写成「已出账」
+_a8 = {"meta": {}, "cash": 10000.0,
+       "nav": [{"date": "2026-09-30", "nav": 10000.0, "cash": 10000.0}], "events": []}
+capital_dyn.book_token(_a8, "50k", "2026-09")
+check("A8 token=0 月不写 booked（可后续补扣）",
+      "2026-09" not in (_a8["meta"].get("token_booked") or {}))
+
+# A7：可投资本不把已实现盈利二次计入
+_a7 = {"meta": {"capital": 55000.0, "initial_capital": 50000.0,
+                "capital_history": [{"month": "2026-12", "date": "2026-12-01",
+                                     "injection": 5000.0, "capital": 55000.0}],
+                "realized_pnl_total": 500.0},
+       "cash": 55000.0, "nav": [{"date": "2026-12-31", "nav": 55000.0, "cash": 55000.0}],
+       "events": [], "holdings": {}, "trades": [], "orders": []}
+_inv7 = paper.investable_capital(_a7)
+check("A7 可投资本不放大（gain=0）",
+      abs(float(_inv7["investable"]) - 55000.0) < 1e-6)
 
 print("=" * 78)
 if BAD:

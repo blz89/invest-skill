@@ -23,6 +23,7 @@ import re
 import sys
 
 import breakdown
+import capital_dyn
 import config
 import paper
 import report_html
@@ -195,8 +196,11 @@ def ledger_diagnostics(state, month, m):
     if cy <= 0:
         sig.append(("warn", "本月现金层利息为 0（朝朝宝/逆回购没操作或没覆盖）"))
     else:
+        _ca = m.get("cash_yield_actual_annual")
+        _cal = (f"｜实得年化 {float(_ca) * 100:.2f}%（口径：events 实际落账 ÷ 现金日，"
+                f"非计划利率×天数）" if _ca is not None else "")
         sig.append(("info", f"现金层利息 {_f(cy)} 元｜逆回购净额 {_f(m.get('repo_net'))} 元"
-                            f"（覆盖 {int(m.get('repo_covered_days') or 0)} 天）"))
+                            f"（覆盖 {int(m.get('repo_covered_days') or 0)} 天）{_cal}"))
     return sig
 
 
@@ -231,7 +235,9 @@ def month_metrics(state, month, ledger=None, period=None):
     token 实花取 out/budget.json 该账本累计 spent（不是年度计提）。
     """
     p_name = str(period or month)
-    cap0 = float(state["meta"].get("capital") or 0.0)
+    # A2：累计收益率/金额的分母是「累计投入」（初始本金 + Σ注资），
+    # 当前本金 meta.capital 每月会被重写成「上月末净值 + 注资」，当历史分母会失真。
+    cap0 = capital_dyn.contributed_capital(state) or float(state["meta"].get("capital") or 0.0)
     navs = sorted((n for n in (state.get("nav") or []) if n.get("date")), key=lambda n: n["date"])
     before = [n for n in navs if str(n["date"]) < f"{p_name}-01"]
     inside = [n for n in navs if str(n["date"]).startswith(p_name)]
@@ -242,6 +248,19 @@ def month_metrics(state, month, ledger=None, period=None):
     nav_start = float(base["nav"]) if base else cap0
     bench_start = base.get("bench_nav") if base else None
     nav_end = float(inside[-1]["nav"]) if inside else nav_start
+    # 现金「cash-days」：日加权现金余额，用来把 events 里**实际落账**的 cash_yield 折成实得年化。
+    # 2026-11-25 A 类修复 #8：月报里同时出现过「计划口径 0.885%」（假设利率×天数，含逆回购
+    # 0.26%/年手续费侵蚀）与「实得 0.829%」（events 实际落账），两个数没有名字，读者会当成误差。
+    # 现在实得这个数由代码现算并显式标口径，不再和计划口径混在一句话里。
+    _cash_pts = [(str(n.get("date")), float(n.get("cash") or 0.0))
+                 for n in (before + inside) if n.get("cash") is not None]
+    cash_days = 0.0
+    for (_d0, _c0), (_d1, _c1) in zip(_cash_pts, _cash_pts[1:]):
+        try:
+            _gap = (datetime.date.fromisoformat(_d1) - datetime.date.fromisoformat(_d0)).days
+        except ValueError:
+            _gap = 0
+        cash_days += float(_c0) * max(0, _gap)
     bench_end = inside[-1].get("bench_nav") if inside else bench_start
     bench_month = None
     if bench_start and bench_end:
@@ -249,7 +268,14 @@ def month_metrics(state, month, ledger=None, period=None):
             bench_month = float(bench_end) / float(bench_start) - 1.0
         except ZeroDivisionError:
             bench_month = None
-    ret_month = (nav_end / nav_start - 1.0) if nav_start else None
+    # A1：注资是现金流，不是收益 —— 把本期到账的注资从区间两端剔除。
+    try:
+        _flow_m = capital_dyn.flows_between(
+            state, str(base["date"]) if base else "",
+            str(inside[-1]["date"]) if inside else "")
+    except Exception:  # noqa: BLE001
+        _flow_m = 0.0
+    ret_month = ((nav_end - _flow_m) / nav_start - 1.0) if nav_start else None
     excess = (ret_month - bench_month) if (ret_month is not None and bench_month is not None) else None
     # 月内最大回撤（以月内起点为基准）
     peak, mdd = nav_start, 0.0
@@ -271,6 +297,11 @@ def month_metrics(state, month, ledger=None, period=None):
     cash_yield = round(sum(float(e.get("amount") or 0.0) for e in (state.get("events") or [])
                            if e.get("level") == "cash_yield"
                            and str(e.get("date") or "").startswith(p_name)), 2)
+    # 实得年化 = 本月落账利息 ÷ (cash-days/365)。口径写清楚才不会被拿去和「计划口径」比：
+    #   实得口径 = events 里 level=="cash_yield" 实际落账（含在途未计息、手续费侵蚀）
+    #   计划口径 = config.cash_rates() 假设利率 × 天数（paper.cash_yield_plan 算，仅供计划）
+    cash_yield_actual_annual = (round(cash_yield / (cash_days / 365.0), 6)
+                                if cash_days > 0 else None)
     # 逆回购：本月落地的 lot（含在途 lot 的应收利息）
     repo_rows = [r for r in (state.get("repo_history") or [])
                  if r.get("kind") == "repo" and str(r.get("date") or "").startswith(p_name)]
@@ -290,7 +321,7 @@ def month_metrics(state, month, ledger=None, period=None):
     repo_eff = (round((repo_interest - repo_fees) / (repo_principal_days / 365.0), 6)
                 if repo_principal_days else 0.0)
     p = paper.portfolio(state, {})
-    pnl_month = round(nav_end - nav_start, 2)
+    pnl_month = round(nav_end - nav_start - _flow_m, 2)
     equity_pnl = round(pnl_month - cash_yield, 2)
     inv = paper.investable_capital(state)
     # 按标的的已实现盈亏
@@ -336,11 +367,14 @@ def month_metrics(state, month, ledger=None, period=None):
         import score as _S
         _bs = _B.budget_state(ledger or "50k", cap0)
         _spent = float(_bs.get("spent_cny") or 0.0)
-        _ret = p.get("total_return")
+        _ret = (nav_end / cap0 - 1.0) if cap0 else None
         if _ret is not None and cap0:
-            _ev = _S.evaluate(_ret, _spent, cap0)
+            _tok_in_nav = bool(capital_dyn.enabled() and capital_dyn.token_from_cash())
+            _spent_eff = 0.0 if _tok_in_nav else _spent
+            _ev = _S.evaluate(_ret, _spent_eff, cap0)
             net_block.update({
                 "token_spent": round(_spent, 2),
+                "token_in_nav": bool(capital_dyn.enabled() and capital_dyn.token_from_cash()),
                 "gross_profit": round(_ev["gross_profit"], 2),
                 "net_profit": round(_ev["net_profit"], 2),
                 "net_rate": _ev["net_rate"], "grade": _ev["grade"],
@@ -353,13 +387,17 @@ def month_metrics(state, month, ledger=None, period=None):
     return {
         "nav_start": round(nav_start, 2), "nav_end": round(nav_end, 2),
         "pnl_month": pnl_month, "ret_month": ret_month, "bench_month": bench_month, "excess": excess,
-        "total_return": p.get("total_return"),
-        "total_pnl": round(nav_end - cap0, 2),
+        "no_data": not bool(inside),
+        "total_return": ((nav_end + paper.withdrawn_total(state)) / cap0 - 1.0
+                         if cap0 else None),
+        "total_pnl": round(nav_end + paper.withdrawn_total(state) - cap0, 2),
+        "contributed": cap0, "flow_month": round(_flow_m, 2),
         "mdd": round(mdd, 6), "trades": len(trades), "buys": len(buys), "sells": len(sells),
         "fees": fees, "fees_pct": (fees / cap0) if cap0 else None,
         "realized": realized, "unrealized": round(p.get("market_value", 0.0)
                                                    - _stock_cost - _otc_cost, 2),
         "cash_yield": cash_yield, "equity_pnl": equity_pnl,
+        "cash_days": round(cash_days, 2), "cash_yield_actual_annual": cash_yield_actual_annual,
         "repo_ops": repo_ops, "repo_covered_days": repo_covered,
         "repo_interest": repo_interest, "repo_fees": repo_fees,
         "repo_net": repo_net, "repo_effective": repo_eff,
@@ -368,6 +406,7 @@ def month_metrics(state, month, ledger=None, period=None):
         "stop_outs": len(stops), "investable": inv.get("investable"),
         "capital": cap0, "gain": inv.get("gain"),
         "net": net_block,
+        "dynamic": capital_dyn.summary(state, month),
     }
 
 
@@ -375,7 +414,7 @@ def year_metrics(state, year, ledger=None):
     """自然年指标：与月度同口径（period=str(year)），另给逐月分解。"""
     y = int(year)
     m = month_metrics(state, f"{y}-12", ledger=ledger, period=str(y))
-    cap0 = float(state["meta"].get("capital") or 0.0)
+    cap0 = capital_dyn.contributed_capital(state) or float(state["meta"].get("capital") or 0.0)
     navs = sorted((n for n in (state.get("nav") or []) if n.get("date")), key=lambda n: n["date"])
     first = str(navs[0]["date"])[:7] if navs else ""
     months = []
@@ -404,8 +443,12 @@ def year_metrics(state, year, ledger=None):
         days = ((datetime.date.fromisoformat(max(dates))
                  - datetime.date.fromisoformat(min(dates))).days + 1) if dates else None
         cap_start = float(m.get("nav_start") or cap0 or 0.0)
-        net_y = round(float(m.get("pnl_year") or 0.0) - spent_y, 2)
-        ev = _S.evaluate(float(m.get("ret_year") or 0.0), spent_y, cap_start or 1.0,
+        # A4：token_from_cash 下 nav 已是净口径（年度收益已扣 token），再减一次会把
+        # 正收益打成负的（实测 +87.5 元 → −50 元、C 档 → D 档）。
+        _tok_in_nav_y = bool(capital_dyn.enabled() and capital_dyn.token_from_cash())
+        _tok_arg = 0.0 if _tok_in_nav_y else spent_y
+        net_y = round(float(m.get("pnl_year") or 0.0) - _tok_arg, 2)
+        ev = _S.evaluate(float(m.get("ret_year") or 0.0), _tok_arg, cap_start or 1.0,
                          mdd=m.get("mdd"), days=days, net_profit=net_y,
                          as_of=f"{y + 1}-01-01")
         m["net"] = {
@@ -487,6 +530,14 @@ def gather(month, only=None):
     return ledgers
 
 
+def _fmt_window(w):
+    if not w:
+        return "—"
+    if isinstance(w, dict):
+        return f"{w.get('base')}~{w.get('last')}（{w.get('weeks')} 周）"
+    return w
+
+
 def scorecard_text(only=None):
     """复用 review.py 的判定，拼成一段文字（样本不足/未达标/暂达标）。"""
     try:
@@ -506,15 +557,26 @@ def scorecard_text(only=None):
             continue
         lines.append(
             f"- {row.get('label') or name}：{row.get('verdict')}"
-            f"｜窗口 {row.get('window')}｜平仓 {row.get('closed_trades')} 笔"
+            f"｜窗口 {_fmt_window(row.get('window'))}｜平仓 {row.get('closed_trades')} 笔"
             f"｜总收益 {_pct(row.get('total_return'), arrow=True)}"
             f"｜超额 {_pct(row.get('excess'), arrow=True)}"
             f"｜回撤 {_pct(row.get('max_drawdown'), arrow=True)}"
+            f"｜本季净收益 {_pct(((row.get('net') or {}).get('quarter') or {}).get('net_return'), arrow=True)}"
+            f"（季目标 {_pct(((row.get('net') or {}).get('quarter') or {}).get('target_rate'), arrow=True)}）"
             f"｜费用占比 {_pct(row.get('fees_pct'))}"
 )
         for r in (row.get("verdict_reasons") or [])[:3]:
             lines.append(f"  - {r}")
     return "\n".join(lines)
+
+
+_ACT_CN = {"buy": "买入", "sell": "卖出", "buy_open": "买入", "sell_open": "卖出",
+           "buy_limit": "买入", "sell_stop": "卖出"}
+
+
+def _act_cn(action) -> str:
+    a = str(action or "")
+    return _ACT_CN.get(a.lower(), a)
 
 
 def to_md(month, data, sc, start, end):
@@ -535,6 +597,19 @@ def to_md(month, data, sc, start, end):
             for lvl, txt in (d.get("items") or []):
                 L.append(f"- **{d.get('label')}**｜{'⚠ ' if lvl == 'warn' else ''}{txt}")
         L.append("")
+    # 信号面验证（2026-11-25 起）：事件面/政策面的预测兑现度，只记录，不改打分
+    L += ["### 信号面验证（只记录，不改规则）", ""]
+    try:
+        import news_eval
+        L += news_eval.section_md()
+    except Exception as exc:  # noqa: BLE001
+        L += [f"- 事件面命中率：读取失败（{type(exc).__name__}）。"]
+    try:
+        import policy_map
+        L += policy_map.section_md()
+    except Exception as exc:  # noqa: BLE001
+        L += [f"- 政策面跟踪：读取失败（{type(exc).__name__}）。"]
+    L.append("")
     # 二、技能优化（A 类当场执行、B 类待拍板）
     L += ["## 二、技能优化（A 类已执行 / B 类待拍板）", ""]
     if retro.get("optimization"):
@@ -612,7 +687,7 @@ def to_md(month, data, sc, start, end):
             L += ["| 日期 | 代码 | 名称 | 动作 | 股数 | 价 | 金额 | 费用 | 已实现 | 原因 |",
                   "|---|---|---|---|---|---|---|---|---|---|"]
             for t in trades:
-                L.append(f"| {t.get('date')} | {t.get('code')} | {t.get('name')} | {t.get('action')} | "
+                L.append(f"| {t.get('date')} | {t.get('code')} | {t.get('name')} | {_act_cn(t.get('action'))} | "
                          f"{_f(t.get('shares'), 0)} | {_f(t.get('price'), 3)} | {_f(t.get('amount'))} | "
                          f"{_f(t.get('fee'))} | {_f(t.get('realized_pnl'))} | {t.get('why') or ''} |")
             L.append("")
@@ -641,6 +716,45 @@ def to_md(month, data, sc, start, end):
                      f"**{_f(bd.get('total_pnl'))}** | 100% |")
             L += ["", f"> {breakdown.note_text(bd)}", ""]
     # 五、策略可行性判定（五问：样本/钱从哪来/风险预算/执行偏差/证伪命中）
+    _dyn = (data.get("ledgers", {}) or {})
+    for _lg, _info in _dyn.items():
+        _dd = (_info.get("month") or {}).get("dynamic") or {}
+        if not _dd or not _dd.get("enabled"):
+            continue
+        L += ["### 动态本金与月度等价年化（口径 2026-11-26 起）", ""]
+        if _dd.get("this_month_injected"):
+            L.append(f"- 本月报时刻注入 {_f(_dd.get('injection_cny'))} 元；本金 = 上月末净值 + 注资 = "
+                     f"**{_f(_dd.get('capital'))} 元**（累计注资 {_f(_dd.get('injected_total'))} 元 / "
+                     f"{_dd.get('injections')} 次）")
+        else:
+            L.append(f"- 本月**没有**注资（起始月 {_dd.get('start_month')}，已累计注资 "
+                     f"{_f(_dd.get('injected_total'))} 元 / {_dd.get('injections')} 次）；"
+                     f"当前本金 {_f(_dd.get('capital'))} 元，口径 = 上月末净值 + 历史注资")
+        L.append("- 月收益率 = 月末净值 / 月初净值 − 1（**不含**当月注资）；"
+                 "等价年化 = (1+月收益率)^(365/该月实际运行天数) − 1")
+        L += ["", "| 月份 | 实际运行天数 | 月收益率 | 等价年化 | 盈亏（元） |",
+              "|---|---|---|---|---|"]
+        for _r in (_dd.get("rates") or []):
+            L.append("| %s | %s | %s | %s | %s |" % (
+                _r.get("month"), _r.get("days") or "—",
+                _pct(_r.get("r"), arrow=True), _pct(_r.get("equiv"), arrow=True),
+                _f(_r.get("pnl"))))
+        L += ["", f"- **本年（{_dd.get('year')}）平均（年初至本月，年报定档口径）："
+                  f"{_pct(_dd.get('year_mean_equiv'), arrow=True)}**（{_dd.get('year_months')} 个月）"]
+        _thin = [r for r in (_dd.get("rates") or []) if (r.get("days") or 0) < 5]
+        if _thin:
+            L.append("- ⚠ 样本偏薄：" + "、".join(f"{r.get('month')} 只运行 {r.get('days')} 天" for r in _thin)
+                     + " → 该月等价年化是外推值，不构成结论（首月或账本重置后常见）。")
+        _miss = _dd.get("year_missing_months") or []
+        if _miss:
+            L.append("- ⚠ 这些月份样本不足、未计入本年平均：" + "、".join(_miss))
+        if (_dd.get("months") or 0) > (_dd.get("year_months") or 0):
+            L.append(f"- 全部历史累计平均（{_dd.get('months')} 个月）：{_pct(_dd.get('mean_equiv'), arrow=True)}"
+                     "（跨年，只作参考，不进年报定档）")
+        if (_dd.get("year_months") or 0) < 3:
+            L.append(f"- 本年只有 {_dd.get('year_months')} 个月样本，平均值只作观察。")
+        L += ["- token 已从账户现金出账（净值 = 净口径）：`收益 = 净值 − 累计投入` 已含 token 成本，"
+              "不再二次扣减。", ""]
     L += ["## 五、策略可行性判定（五问）", ""]
     _v = data.get("viability")
     L += [_v if _v else VIABILITY_PLACEHOLDER.format(key=month), ""]
@@ -654,7 +768,7 @@ def to_md(month, data, sc, start, end):
         L += ["## 七、记分卡（累计）", "", sc, ""]
     L += ["## 八、下月计划", "",
           "- 按「一、上月策略复盘」的改进项执行：A 类已改的从下期生效，B 类等用户拍板后生效；",
-          "- 每周六 20:00 继续按同一套规则决策；不为单月结果调阈值。",
+          "- 每周三、周六 20:30 继续按同一套规则决策；不为单月结果调阈值。",
           "- 净值回撤触发组合熔断线后全部卖出，当周不再开新仓。",
           "- 样本满 12 周且 ≥10 笔平仓后，用记分卡做「可不可行」的判定。",
           "- 任何规则改动走一次 git 提交（原值/新值/依据写进 commit message）。", "",
@@ -731,6 +845,33 @@ def to_md_annual(year, data, sc, start, end):
     if _sh.startswith("## "):
         _sh = "\n".join(_sh.splitlines()[1:]).strip()
     _sh = "\n".join(("### " + ln[3:]) if ln.startswith("## ") else ln for ln in _sh.splitlines())
+    for _lg, _info in (data.get("ledgers") or {}).items():
+        _dd = ((_info.get("year") or {}).get("dynamic")) or {}
+        if not _dd or not _dd.get("enabled"):
+            continue
+        L += ["## 五b、动态本金与月度等价年化（年报定档口径）", ""]
+        L.append(f"- 年中累计注资 {_f(_dd.get('injected_total'))} 元（{_dd.get('injections')} 次）；"
+                 f"当前本金 {_f(_dd.get('capital'))} 元")
+        L += ["", "| 月份 | 实际运行天数 | 月收益率 | 等价年化 | 盈亏（元） |", "|---|---|---|---|---|"]
+        for _r in (_dd.get("rates") or []):
+            L.append("| %s | %s | %s | %s | %s |" % (
+                _r.get("month"), _r.get("days") or "—",
+                _pct(_r.get("r"), arrow=True), _pct(_r.get("equiv"), arrow=True), _f(_r.get("pnl"))))
+        _rows = _dd.get("rates") or []
+        if _rows:
+            L.append(f"- 先记录最后一个月（{_rows[-1].get('month')}）的等价年化："
+                     f"{_pct(_rows[-1].get('equiv'), arrow=True)}"
+                     f"（{_rows[-1].get('days') or '—'} 天）→ 再取本年所有月平均")
+        L += ["", f"- **年报定档年化 = 本年（{_dd.get('year')}）{_dd.get('year_months')} 个月"
+                  f"等价年化率的算术平均：{_pct(_dd.get('year_mean_equiv'), arrow=True)}**"]
+        _thin = [r for r in (_dd.get("rates") or []) if (r.get("days") or 0) < 5]
+        if _thin:
+            L.append("- ⚠ 样本偏薄：" + "、".join(f"{r.get('month')} 只运行 {r.get('days')} 天" for r in _thin)
+                     + " → 这些月的等价年化是外推值，请结合月份数一起看。")
+        _miss = _dd.get("year_missing_months") or []
+        if _miss:
+            L.append("- ⚠ 这些月份样本不足、未计入本年平均：" + "、".join(_miss))
+        L.append("")
     L += ["## 六、选股评分体检", "", _sh, ""]
     L += ["## 七、记分卡", sc or "（无）", "",
           "边界：模拟盘记录，不构成投资建议，不承诺收益。"]
@@ -758,6 +899,14 @@ def settle_year(state, year, metrics, path, ledger="50k", as_of=None):
     paper.backup_state(path)
     if reward > 0:
         state["cash"] = round(max(0.0, float(state["cash"]) - reward), 2)
+        # A3：奖励是净值流出，最后一根 nav 必须同步减——否则 capital（按 nav 算）
+        # 会比实际现金多出一个 reward，下一年收益被系统性高估。
+        _navs = state.get("nav") or []
+        if _navs:
+            _last = _navs[-1]
+            _last["nav"] = round(max(0.0, float(_last.get("nav") or 0.0) - reward), 2)
+            if "cash" in _last:
+                _last["cash"] = round(max(0.0, float(_last["cash"] or 0.0) - reward), 2)
         paper.event(state, "info",
                     f"年度结算：奖励 {reward:,.2f} 元从现金划出（转次年 token 预算）",
                     date=settled_at)
@@ -847,7 +996,28 @@ def main(argv=None):
                     continue
                 try:
                     st = paper.load(path)
-                    settlement[name] = settle_year(st, year, info["year"], path, ledger=name)
+                    # A1：settle(month) 的 month = **刚结束的报告月**，注入算下一个月；
+                    # 年报对应 12 月，注资才算次年 1 月（原来传 1 月会把 12 月那笔吞掉）。
+                    _rm = f"{year}-12"
+                    _jm = f"{year + 1}-01"
+                    # 收口（token 出账 → 重算月率）失败时必须留痕且**不注资**：
+                    # 否则下一年本金基准会建在「token 未出账、月率未落」的旧净值上（测试审计 A-1）。
+                    _settle_err = ""
+                    try:
+                        capital_dyn.settle(st, name, _rm, inject_after=False)
+                    except Exception as exc:  # noqa: BLE001
+                        _settle_err = f"动态本金收口失败：{exc}"
+                    _row = settle_year(st, year, info["year"], path, ledger=name)
+                    settlement[name] = _row if isinstance(_row, dict) else dict(_row or {})
+                    if _settle_err:
+                        settlement[name]["settle_error"] = _settle_err
+                    else:
+                        try:
+                            _inj = capital_dyn.inject(st, _jm)
+                            if _inj.get("ok") or _inj.get("already"):
+                                paper.save(st, path)
+                        except Exception as exc:  # noqa: BLE001
+                            settlement[name]["inject_error"] = str(exc)
                 except Exception as exc:  # noqa: BLE001 — 结算失败要报，但年报照出
                     settlement[name] = {"error": str(exc)}
         data["settlement"] = settlement
@@ -869,6 +1039,18 @@ def main(argv=None):
                   f"净利润 {_f((y.get('net') or {}).get('net_profit'))} 元｜{flag}")
         return 0
 
+    dyn_res = {}
+    if not a.no_settle:
+        for _name in (only or list(LEDGERS.keys())):
+            _p = (LEDGERS.get(_name) or {}).get("state_file")
+            if not _p or not os.path.exists(_p):
+                continue
+            try:
+                _st = paper.load(_p)
+                dyn_res[_name] = capital_dyn.settle(_st, _name, month)
+                paper.save(_st, _p)
+            except Exception as exc:  # noqa: BLE001 — 动态本金失败不能把月报整个搞挂
+                dyn_res[_name] = {"error": str(exc)}
     ledgers = gather(month, only)
     if not ledgers:
         print("[monthly] 没有可读的账本（先跑 decide.py --init 建账）")
@@ -899,7 +1081,10 @@ def main(argv=None):
         m = info["month"]
         print(f"[monthly] {info['label']}：净值 {_f(m['nav_start'])} → {_f(m['nav_end'])}"
               f"（{_pct(m['ret_month'], arrow=True)}），成交 {m['trades']} 笔，"
-              f"现金层 {_f(m['cash_yield'])} 元 / 权益层 {_f(m['equity_pnl'])} 元")
+              f"现金层 {_f(m['cash_yield'])} 元 / 权益层 {_f(m['equity_pnl'])} 元"
+              + (f"｜注资 {_f((dyn_res.get(name) or {}).get('injection', {}).get('injection'))}"
+                 f" / 本金 {_f((dyn_res.get(name) or {}).get('injection', {}).get('capital'))}"
+                 if ((dyn_res.get(name) or {}).get("injection") or {}).get("ok") else ""))
     return 0
 
 

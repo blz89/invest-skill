@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 import numpy as np
 import pandas as pd
@@ -227,3 +228,92 @@ def mean_ignore_none(vals: list[float | None]) -> float | None:
     if not v:
         return None
     return float(np.mean(v))
+
+
+# ---------------------------------------------------------------- 基金「持有期」解析（2026-11-25）
+# 为什么放在 metrics（纯函数模块）而不是 plan.py 或 otc.py：两处都要用，而这个解析是
+# 「从名字里读合同条款」的纯字符串活，跟计划/取数都无关。放在任一侧都会造成 import 方向问题
+# （otc.py 不能 import plan.py：plan 是更上层编排），所以下沉到两边都 import 的 metrics。
+_CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_HOLD_PERIOD_RE = re.compile(
+    r"(?P<n>\d+|[一二两三四五六七八九十]{1,3})\s*(?P<u>个月|月|天|日|年|周)\s*(?:滚动)?持有")
+
+
+def hold_period_days(name) -> int | None:
+    """从基金名称解析「持有期」天数；None = 名称里没有持有期条款（随时可赎）。
+
+    >>> hold_period_days("建信鑫弘180天持有期债券C")
+    180
+    >>> hold_period_days("建信鑫和30天持有期债券C")
+    30
+    >>> hold_period_days("永赢中债3-5年政金债指数C") is None
+    True
+
+    为什么需要：2026-11-02 买了 018193 建信鑫弘「180 天持有期」C（2,300 元），钱锁到 2027-05-01。
+    选池只看了业绩/回撤/费率/规模，**没看合同锁定期**；而 SKILL 的「R2 不足 90 天不赎回」
+    只是策略纪律 —— 锁定期比 90 天更长时，纪律根本轮不到生效。
+    """
+    s = str(name or "")
+    mm = _HOLD_PERIOD_RE.search(s)
+    if not mm:
+        # A11：定开/封闭产品名里常常不写「N 天持有期」，但封闭期内同样不能赎回。
+        # fail-closed 按最长持有期处理（10 年），选池与赎回守卫都会把它挡掉。
+        if any(k in s for k in ("定开", "封闭")):
+            return 3650
+        return None
+    raw, unit = mm.group("n"), mm.group("u")
+    n = int(raw) if raw.isdigit() else _CN_NUM.get(raw)
+    if not n:
+        return None
+    if unit == "年":
+        return n * 365
+    if unit == "周":
+        return n * 7
+    if unit in ("个月", "月"):
+        return n * 30
+    return n
+
+
+# ---------------------------------------------------------------- 债券「前瞻票息」（2026-11-25，B-12）
+# 为什么放这里：otc.py 给 R2 池打分要用，plan.py 的 R2 钱账也要用；两边都 import metrics。
+# 为什么一定要前瞻口径：R2 池的 ret_1y/ret_3y 全部落在 2023–2026 的债牛里（SKILL §8.11 原话：
+# 「这是过去 3 年落在债牛里的历史净值口径，不是预期收益」）。用后视均值当预期 = 把后视镜当挡风玻璃；
+# 前瞻能拿到的确定性数据只有国债曲线的到期收益率。
+def fwd_bond_yield(cache_dir=None, years=(3, 5)):
+    """国债曲线缓存里 3Y/5Y 最新到期收益率的算术均值（小数）。取不到 → (None, "")。
+
+    缓存文件：`cache/cn_treasury_yield/gov_curve__YYYY-MM-DD.csv`，
+    列 y3/y5 是**百分数**（1.240 表示 1.24%），这里统一换成小数。
+    """
+    import os
+    if cache_dir is None:
+        try:
+            import config
+            cache_dir = os.path.join(config.CACHE_DIR, "cn_treasury_yield")
+        except Exception:          # noqa: BLE001 —— 纯计算模块不硬依赖 config
+            return None, ""
+    try:
+        files = sorted(f for f in os.listdir(cache_dir)
+                       if f.startswith("gov_curve__") and f.endswith(".csv"))
+    except OSError:
+        return None, ""
+    if not files:
+        return None, ""
+    asof = files[-1][len("gov_curve__"):-len(".csv")]
+    try:
+        df = pd.read_csv(os.path.join(cache_dir, files[-1]))
+    except Exception:              # noqa: BLE001
+        return None, ""
+    if df is None or df.empty:
+        return None, ""
+    row = df.iloc[-1]
+    vals = []
+    for i in years:
+        x = f(row.get("y%d" % i))
+        if x is None:
+            continue
+        vals.append(x / 100.0 if x > 0.2 else x)   # 曲线 CSV 是百分数
+    if not vals:
+        return None, ""
+    return float(np.mean(vals)), asof

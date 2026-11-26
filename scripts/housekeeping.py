@@ -15,6 +15,9 @@
    策略：同一个 key 只保留最近 `keep_last` 个日期的快照（默认 2 天，防跨零点
    重跑时需要昨天那份），更早的删掉；`out/patrol_*.md` 超过 `md_keep_days`
    天也删掉（结论已经在 daily_log 里留了一行，md 只是当日快照）。
+   `stock/data/archive/<YYYY-MM-DD>/` 每日快照目录保留 `archive_keep_days` 天
+   （默认 14 天，每份约 2.5MB；最新一份永不删，名字带 `_pre_fresh_start` 等
+   非纯日期的回滚目录一律不动）。
 
 安全阀：一次要删掉超过 80% 的缓存文件时**拒绝执行**并报错——这只会发生在
 「命名规则变了/路径配错」的时候，宁可留着也不能误删。
@@ -36,6 +39,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -492,7 +496,7 @@ def year_md(year):
 
 
 # ------------------------------------------------------------- 清理策略
-# ---------------------------------------------------- 周汇总（周六统一整理）
+# ---------------------------------------------------- 周汇总（决策日后整理）
 def _row_dict(line: str) -> dict:
     cells = [c.strip() for c in line.strip().strip("|").split("|")]
     cols = COLS if len(cells) == len(COLS) else LEGACY_COLS
@@ -577,7 +581,7 @@ def week_digest(start: str | None = None, end: str | None = None) -> dict:
 
 
 def week_md(dig: dict) -> str:
-    """周汇总的 markdown（每周六读周一到周五）。"""
+    """周汇总的 markdown（读上一个决策周期的工作日）。"""
     L = ["# 巡检周报 %s ~ %s" % (dig["start"], dig["end"]), "",
          "> 由 `housekeeping.py --week` 生成（0 token）：只汇总已落盘的周一到周五巡检记录，不重算行情。",
          "> 逐日明细看 `out/patrol_<日期>.md`；要一年口径看 `--year`。", ""]
@@ -759,14 +763,87 @@ def prune_paper_reports(keep_days=None, today=None, dry=False):
     return {"deleted": gone, "keep_days": keep_days, "today": today}
 
 
-def sweep(keep_last=None, md_keep_days=None, today=None, dry=False, paper_keep_days=None):
-    """巡检末尾一次做完：记账 + 清缓存 + 清旧巡检 md + 清超期报告。"""
+# stock/data/archive/<YYYY-MM-DD>/ —— 每日快照目录（人工留档，非仓库产物）
+_DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def archive_root():
+    """每日快照目录的根：`<工作目录的父级>/archive`（技能里即 stock/data/archive）。"""
+    return os.path.join(os.path.dirname(os.path.abspath(WORK)), "archive")
+
+
+def plan_archive_prune(keep_days=14, today=None):
+    """算出该删哪些每日快照目录（不删）。返回 (to_delete, stats)。
+
+    只认**纯日期**目录名（YYYY-MM-DD）；名字带 `_pre_fresh_start`/`pre_reset` 等
+    后缀的回滚目录与 `_*` 一律不动；最新一份永远保留（防时钟异常把近期快照清空）。
+    """
+    keep_days = max(0, int(keep_days))
+    today = today or dt.date.today().isoformat()
+    t = dt.date.fromisoformat(today)
+    root = archive_root()
+    cands = []
+    if os.path.isdir(root):
+        for fn in sorted(os.listdir(root)):
+            p = _p(root, fn)
+            if not os.path.isdir(p) or not _DATE_DIR_RE.match(fn):
+                continue
+            try:
+                age = (t - dt.date.fromisoformat(fn)).days
+            except ValueError:
+                continue
+            cands.append((age, p))
+    stats = {"dirs": len(cands), "keep_days": keep_days, "today": today}
+    if not cands:
+        stats["keep"] = 0
+        return [], stats
+    newest = min(cands, key=lambda x: x[0])[1]
+    to_delete = [p for age, p in cands if age > keep_days and p != newest]
+    stats["keep"] = len(cands) - len(to_delete)
+    return to_delete, stats
+
+
+def prune_archive(keep_days=None, today=None, dry=False, guard=0.8):
+    """按保留天数删 `stock/data/archive/<YYYY-MM-DD>/` 每日快照目录。返回统计 dict。"""
+    cfg = getattr(config, "PATROL", {}) or {}
+    keep_days = int(keep_days if keep_days is not None
+                    else cfg.get("archive_keep_days", 14))
+    to_delete, stats = plan_archive_prune(keep_days, today=today)
+    total = stats["dirs"]
+    n = len(to_delete)
+    if total and n > total * guard:
+        return {"ok": False, "error": "拒删：要删除 %d/%d 个目录（>%.0f%%），疑似日期解析或路径异常"
+                % (n, total, guard * 100), "deleted": 0, "freed_mb": 0.0}
+    freed = 0
+    done = 0
+    for path in to_delete:
+        sz = sum(os.path.getsize(os.path.join(dp, f))
+                 for dp, _d, fs in os.walk(path) for f in fs)
+        if dry:
+            freed += sz
+            done += 1
+            continue
+        try:
+            shutil.rmtree(path)
+            freed += sz
+            done += 1
+        except OSError:
+            pass
+    return {"ok": True, "deleted": done, "candidates": n,
+            "freed_mb": round(freed / 1048576.0, 1),
+            "keep_days": keep_days, "kept_dirs": stats["keep"]}
+
+
+def sweep(keep_last=None, md_keep_days=None, today=None, dry=False, paper_keep_days=None,
+          archive_keep_days=None):
+    """巡检末尾一次做完：记账 + 清缓存 + 清旧巡检 md + 清超期报告 + 清旧每日快照。"""
     cfg = getattr(config, "PATROL", {}) or {}
     keep_last = int(keep_last if keep_last is not None else cfg.get("cache_keep_days", 2))
     md_keep_days = int(md_keep_days if md_keep_days is not None else cfg.get("patrol_md_keep_days", 365))
     return {"cache": prune_cache(keep_last, dry=dry),
             "patrol_md": prune_patrol_md(md_keep_days, today=today, dry=dry),
-            "paper": prune_paper_reports(paper_keep_days, today=today, dry=dry)}
+            "paper": prune_paper_reports(paper_keep_days, today=today, dry=dry),
+            "archive": prune_archive(archive_keep_days, today=today, dry=dry)}
 
 
 # ------------------------------------------------------------------ CLI
@@ -778,7 +855,7 @@ def build_parser():
         epilog=__doc__)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--show", action="store_true", help="打印 daily_log 末尾 N 行")
-    g.add_argument("--prune", action="store_true", help="单独跑清理（缓存 + 旧巡检 md）")
+    g.add_argument("--prune", action="store_true", help="单独跑清理（缓存 + 旧巡检 md + 超期报告 + 旧每日快照）")
     g.add_argument("--week", metavar="YYYY-MM-DD", nargs="?", const="auto",
                    help="周汇总：读出周一到周五的巡检记录（默认上一个完整工作周），写 out/patrol_weekly_<周一>.md")
     g.add_argument("--year", metavar="YYYY", help="年报底稿（资产区间/年化/回撤/正收益天数/token）")

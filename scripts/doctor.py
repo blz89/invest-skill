@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """系统体检（read-only）：每次决策前先跑一遍，回答「现在能不能跑、跑出来会不会是错的」。
 
-为什么要有它：这套系统是无人值守的（每周六 20:00 决策、交易日 19:00 由 Windows 计划任务统一取数、20:00 DSH 巡检会话算账本；决策日不取数），
+为什么要有它：这套系统是无人值守的（每周三、周六 20:30 决策、交易日 19:00 由 Windows 计划任务统一取数、20:00 DSH 巡检会话算账本；决策日不取数），
 最大的风险不是模型算错，而是**静默失败**——账本被手改过、out/ 是别的本金生成的、
 数据没更新、挂单和持仓对不上。这些问题不会让脚本报错，只会让账本悄悄记错钱。
 
@@ -16,7 +16,7 @@
   F. 利率时效：现金层假设利率与验收基准（1 年期国债）和实测值是否已偏离到「过期」（只 WARN）。
   G. 决策新鲜度：out/paper/decision*_latest.json 是否为最近一个交易日（超过 8 个自然日 = 漏跑，WARN）；
   H. 持仓等级：持仓必须 ⊆ R2/R3 且加权等级在区间内（R4/R5 = ERROR）；
-  I. 决策数据日期：out/stage3_plan.json 的 data_as_of 是否等于最近交易日（落后：周六决策日 = ERROR，其它日 = WARN；字段缺失跳过）。
+  I. 决策数据日期：out/stage3_plan.json 的 data_as_of 是否等于最近交易日（落后：决策日 = ERROR，其它日 = WARN；字段缺失跳过）。
 
 用法：
   python scripts/doctor.py                  # 体检全部账本（本部署只有 50k）
@@ -76,7 +76,7 @@ def _weekday_back(day_iso):
 def last_trading_day(day=None):
     """数据意义上「最近已收盘/已取数」的交易日（只读本地日历缓存，绝不联网）。
 
-    本部署取数在交易日 19:00 由本机任务（`stock prefetch`）统一完成、决策日（周六）不取数，所以
+    本部署取数在交易日 19:00 由本机任务（`stock prefetch`）统一完成、决策日（周三/周六）不取数，所以
     「数据是否新鲜」要按最近交易日算，而不是按今天算。日历缓存在
     <CACHE_DIR>/calendar/trade__*.csv（列 trade_date）；没有缓存时退化为跳过周末
     （节假日以缓存为准）。
@@ -183,7 +183,9 @@ def nav_baseline_problems(state):
     meta = state.get("meta") or {}
     nav = state.get("nav") or []
     try:
-        cap = float(meta.get("capital"))
+        # A10：首点 bench_nav 对应的是**初始本金**，不是逐月变动的当前本金。
+        cap = float(meta.get("initial_capital") or meta.get("bench_baseline_capital")
+                    or meta.get("capital"))
     except (TypeError, ValueError):
         return []
     bd = str(meta.get("baseline_date") or "")
@@ -282,8 +284,13 @@ def check_ledger(rep, name, cfg):
     else:
         rep.ok("账本", f"{name} meta 完整", f"本金 {float(meta['capital']):,.0f} 元 / {meta['tier']} 档")
     if abs(float(meta.get("capital") or 0) - capital) > 0.01:
-        rep.error("账本", f"{name} 本金与配置一致",
-                  f"账本 {float(meta.get('capital') or 0):,.0f} vs 配置 {capital:,.0f}")
+        if meta.get("capital_history"):
+            # A10：动态本金跑过后本金每月会被重算，偏离配置是预期行为 → WARN，不阻断决策。
+            rep.warn("账本", f"{name} 本金与配置一致（动态本金允许偏离配置）",
+                     f"账本 {float(meta.get('capital') or 0):,.0f} vs 配置 {capital:,.0f}")
+        else:
+            rep.error("账本", f"{name} 本金与配置一致",
+                      f"账本 {float(meta.get('capital') or 0):,.0f} vs 配置 {capital:,.0f}")
     cash = float(st.get("cash") or 0)
     if cash < -0.01:
         rep.error("账本", f"{name} 现金非负", f"现金 {cash:,.2f}")
@@ -457,8 +464,8 @@ def check_plan(rep, name, cfg, state, ledgers=None):
     elif dao < ltd:
         det = (f"data_as_of={dao}，落后最近交易日 {ltd}"
                f"（本机交易日 19:00 统一取数失败/未更新；决策日不取数）")
-        if dt.date.fromisoformat(TODAY).weekday() == 5:
-            rep.error("决策", f"{name} 数据日期", det + "；周六决策日视为异常（NO-GO）")
+        if dt.date.fromisoformat(TODAY).weekday() in (2, 5):
+            rep.error("决策", f"{name} 数据日期", det + "；决策日（周三/周六）视为异常（NO-GO）")
         else:
             rep.warn("决策", f"{name} 数据日期", det)
     else:
@@ -475,8 +482,8 @@ def check_freshness(rep, name, pout=None):
     """决策新鲜度：上次决策快照是哪一天？（无人值守下「漏跑一次」不会报错，只会静默拖期）
 
     `out/paper/decision*_latest.json` 由 weekly.py 每期写一次，as_of 就是决策日。
-    每周六一次，所以超过 8 个自然日没更新，说明至少漏了一期——只 WARN，不拦决策。
-    阈值 8 = 最长正常间隔 7 天 + 1 天缓冲（决策当晚 doctor 会看到「7 天前」的快照）。
+    每周两次（周三/周六），超过 8 个自然日没更新，说明至少漏了一期——只 WARN，不拦决策。
+    阈值 8 = 最长正常间隔 4 天（周三/周六之间）留足 4 天缓冲，覆盖长假与漏跑两期。
     """
     pout = pout or PAPER_OUT
     suffix = "" if name == config.PAPER.get("default_ledger", "50k") else f"_{name}"
@@ -497,7 +504,7 @@ def check_freshness(rep, name, pout=None):
     age = (dt.date.fromisoformat(TODAY) - d0).days
     if age > 8:
         rep.warn("决策", f"{name} 决策新鲜度",
-                 f"上次决策 {as_of}，已过 {age} 天（每周六应有一次，可能漏跑）")
+                 f"上次决策 {as_of}，已过 {age} 天（每周三/周六应各一次，可能漏跑）")
     else:
         rep.ok("决策", f"{name} 决策新鲜度", f"上次决策 {as_of}（{age} 天前）")
 
@@ -861,8 +868,8 @@ def check_rate_staleness(rep):
 
 def check_selftest(rep):
     """可选：跑两套离线自检（不联网，约 5 秒）。"""
-    for script, label, expected in (("_selftest.py", "本金/整手/费用自检", "通过"),
-                                    ("_selftest_paper.py", "账本撮合/止损自检", "75 项")):
+    for script, label in (("_selftest.py", "本金/整手/费用自检"),
+                          ("_selftest_paper.py", "账本撮合/止损自检")):
         path = os.path.join(HERE, script)
         try:
             out = subprocess.run([sys.executable, path], capture_output=True, text=True,

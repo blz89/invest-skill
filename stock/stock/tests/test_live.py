@@ -10,7 +10,7 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # D:\
 
 from stock import api  # noqa: E402
 

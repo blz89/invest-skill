@@ -348,7 +348,7 @@ def apply_news(results: list[dict], as_of: str = "") -> tuple[list[dict], dict]:
 def _names_for_gross(gross) -> int:
     """按权益比例决定排名篮子只数（config.EXEC.max_stock_names_by_ratio）。"""
     table = list(config.EXEC.get("max_stock_names_by_ratio") or [])
-    fallback = max(1, int(config.EXEC.get("max_stock_names") or 4))
+    fallback = max(1, int(config.EXEC.get("max_stock_names") or 3))
     if gross is None or not table:
         return fallback
     g = float(gross)
@@ -363,14 +363,15 @@ def pick(results: list[dict], regime: dict,
     """选个股组合：默认「排名篮子」（config.EXEC["stock_weighting"]），conviction 口径可选。
 
     rank（默认）：
-      买入区与观察区按总分合并排序，取前 N 名（N 随档位：≤35% 4 只、≤60% 5 只、>60% 6 只），
+      买入区与观察区按总分合并排序，取前 N 名（N 随档位：≤35% 3 只、≤60% 4 只、>60% 5 只），
       按 rank_weights 给线性权重系数（1.0/0.85/0.70/0.55）。
       为什么：买入线 70 是绝对门槛，大多数周只有 0–1 只达标；conviction 口径下这一只
       独占个股层 50%+，组合外观变成「押注一只股票」。排名篮子让「达标但没进买入区」
       的标的也按排名分到仓位，评分仍是唯一排序依据——没有新增或下调任何阈值。
     conviction（可选开关，仅回滚用）：
       买入区 = 核心仓（系数 1.0，最多 max_n 只）；观察区前 2 名 = 试探仓（系数 0.5）。
-      注意：回滚口径仍按 `gross / 单票上限` 推算只数，不读 `max_stock_names_by_ratio`。
+      注意：回滚口径按 `gross / 单票上限` 推算只数，但夹到排名篮子档位上限（≤5）；
+      不读 `max_stock_names_by_ratio` 的具体档位。
     """
     buy = sorted([r for r in results if r["verdict"] == "买入区"],
                  key=lambda r: -(r["scores"].get("total") or 0))
@@ -429,6 +430,9 @@ def _pick_conviction(buy: list[dict], watch: list[dict],
                      regime: dict) -> tuple[list[dict], str]:
     """conviction 口径：核心仓 = 买入区，试探仓 = 观察区前 2 名。"""
     max_n = max(1, int(round(regime["base_gross"] / config.EXEC["max_single_position"])))
+    _basket_cap = max(int(n) for _, n in (config.EXEC.get("max_stock_names_by_ratio")
+                                          or [[1.0, 5]]))
+    max_n = max(1, min(max_n, _basket_cap))
     watch_mult = float(config.EXEC.get("watch_weight", 0.0))
     chosen = [{"r": r, "mult": 1.0} for r in buy[:max_n]]
     n_probe = 0
@@ -579,7 +583,14 @@ def etf_layer(pool: list[dict], budget: float, capital: float,
     min_pos = cfg.get("min_position_value", 800.0)
     n_by_budget = int(budget // min_pos)
     n_by_cap = max(1, int(math.ceil(etf_budget_ratio / cfg["max_single"] - 1e-9)))
-    n = max(0, min(cfg["max_etf_n"], n_by_budget, n_by_cap))
+    # 2026-11-25 B 类 #13：ETF 只数也随档位走（1/2/3），不再是固定上限 8 只。
+    _etf_table = list(config.EXEC.get("max_etf_names_by_ratio") or [])
+    _etf_n_cap = int(cfg["max_etf_n"])
+    for _lim, _n in _etf_table:
+        if etf_budget_ratio <= float(_lim) + 1e-9:
+            _etf_n_cap = min(_etf_n_cap, max(1, int(_n)))
+            break
+    n = max(0, min(_etf_n_cap, n_by_budget, n_by_cap))
     if n == 0:
         out["note"] = (f"剩余权益预算 {budget:,.0f} 元 < 单笔最小 {min_pos:,.0f} 元，"
                        f"转现金层（小资金下拆太碎，5 元最低佣金会吃掉收益）")
@@ -604,6 +615,23 @@ def etf_layer(pool: list[dict], budget: float, capital: float,
                 "sym": e["sym"], "name": e["name"],
                 "lot_cost": row["lot_cost"],
                 "note": f"1 手需 {row['lot_cost']:,.0f} 元 > 单只预算 {per:,.0f} 元"})
+            continue
+        # 金额否决（2026-11-25，A 类修复）：「1 手买得起」≠「成本可接受」。
+        # 起因：10-29 sh510050 只买了 574.40 元（5 元佣金 = 0.87%），却因为
+        # ETF.min_position_value=800 只是「计划建议」而非执行闸门而被放行。
+        blocked = cost_blocked_row(row["actual_amount"], True)
+        if blocked:
+            out["unaffordable"].append({
+                "sym": e["sym"], "name": e["name"],
+                "lot_cost": row["lot_cost"], "note": blocked["note"]})
+            continue
+        # 往返成本率（2026-11-25 B 类 #14）：800 元 ETF 单边 0.63% 看着还行，
+        # 一买一卖是 1.26% —— 一个季度的目标才 0.325%，这种腿不能建。
+        rt = roundtrip_blocked_row(row["actual_amount"], True)
+        if rt:
+            out["unaffordable"].append({
+                "sym": e["sym"], "name": e["name"],
+                "lot_cost": row["lot_cost"], "note": rt["note"]})
             continue
         if ind_key is not None:
             used[ind_key] = used.get(ind_key, 0.0) + row["actual_weight"]
@@ -759,8 +787,130 @@ def load_wealth_pool() -> tuple[list[dict], str]:
     return rows, f"R2 债券 ETF 候选 {len(rows)} 只（按综合分排序）"
 
 
+# ------------------------------------------------------------ 执行闸门：单笔成本率（2026-11-25）
+# 为什么闸门做成函数、在三处调用，而不是在「生成 orders」那一处统一卡：
+# 下单金额由三条腿各自算（个股 ladder / ETF 手数 / 场外金额），任何一条腿都可能算出
+# 「5 元佣金 = 1%」的碎单；而「生成 orders 之后统一卡」有个死角 —— 有的腿在**生成前**就要
+# 用真实金额决定权重与剩余预算（例如 ETF 腿选完才发现这笔该毙掉），事后删单会让预算账对不上。
+# 所以：能早判的早判（etf_layer / 个股循环），最后再兜一次全部 orders。口径只有一份 = 真实费率。
+def buy_cost_ratio(amount: float, is_etf: bool = False) -> float:
+    """单笔买入佣金占成交额比例（真实费率，含 5 元最低佣金）。"""
+    try:
+        return float(cap.trade_fee(float(amount or 0.0), is_etf=bool(is_etf),
+                                   side="buy").get("ratio") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def cost_block_limit() -> float:
+    return float(config.CAPITAL.get("commission_ratio_block") or 0.0065)
+
+
+def cost_blocked_row(amount: float, is_etf: bool) -> dict | None:
+    """超上限 → 返回「被拦下」的记录；未超 → None。
+
+    触发的典型：sh510050 574.40 元（0.87%）、601058 1,144 元（0.44% 未触发，但接近）。
+    """
+    ratio = buy_cost_ratio(amount, is_etf)
+    lim = cost_block_limit()
+    if ratio <= lim + 1e-12:
+        return None
+    return {"amount": round(float(amount), 2), "is_etf": bool(is_etf),
+            "ratio": round(ratio, 6), "limit": lim,
+            "note": f"单笔 {float(amount):,.0f} 元佣金占比 {ratio:.2%} > 上限 {lim:.2%}"
+                    f"（5 元最低佣金 ÷ 金额）→ 不下单"}
+
+
+# ------------------------------------------------------------ 执行闸门二：往返成本率 + 赔率（2026-11-25 B 类 #14）
+# 单边成本率（上面那道）只管「这一笔佣金占比」；真正吃掉收益的是**一买一卖**：
+# 买入 5 元 + 卖出 5 元 + 卖出印花税 0.05%（ETF 免）+ 过户费，落在 2,000 元的腿上是 0.5%。
+# 所以第二道闸门按往返算，超 0.60% 不建这条腿（不是「买了再说」）。
+def roundtrip_cost_ratio(amount: float, is_etf: bool = False) -> float:
+    """往返成本率 =（买入费 + 卖出费 + 卖出印花税）/ 金额。"""
+    try:
+        amt = float(amount or 0.0)
+        if amt <= 0:
+            return 0.0
+        buy = float(cap.trade_fee(amt, is_etf=bool(is_etf), side="buy").get("total") or 0.0)
+        sell = float(cap.trade_fee(amt, is_etf=bool(is_etf), side="sell").get("total") or 0.0)
+        return (buy + sell) / amt
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def roundtrip_block_limit() -> float:
+    return float(config.EXEC.get("max_roundtrip_cost") or 0.006)
+
+
+def roundtrip_blocked_row(amount: float, is_etf: bool) -> dict | None:
+    """往返成本率超上限 → 返回被拦记录；未超 → None。"""
+    ratio = roundtrip_cost_ratio(amount, is_etf)
+    lim = roundtrip_block_limit()
+    if ratio <= lim + 1e-12:
+        return None
+    return {"amount": round(amount, 2), "is_etf": bool(is_etf),
+            "ratio": round(ratio, 6), "limit": lim,
+            "note": f"往返成本率 {ratio:.2%} > 上限 {lim:.2%}"
+                    f"（买 5 元 + 卖 5 元 + 印花税 ÷ {amount:,.0f} 元）→ 不建这条腿"}
+
+
+def min_risk_reward() -> float:
+    return float(config.EXEC.get("min_risk_reward") or 1.5)
+
+
+def risk_reward_of(pricing: dict, entry_price) -> float | None:
+    """赔率 =（目标价 − 计划买价）÷（计划买价 − 止损价）。
+
+    为什么用计划买价而不是现价：限价单是按 ladder 第 1 批价挂的，按现价算赔率会把
+    「等回调再买」错判成「追高买入」。以 000999 为例（目标 38.01、止损 18.53）：按现价
+    25.40 买赔率 1.84，按限价 22.21 买赔率 4.29 —— 同一只票，价格不同结论不同，必须按限价算。
+    """
+    pr = pricing or {}
+    try:
+        target = float(pr.get("target_price") or 0.0)
+        stop = float(pr.get("stop_price") or 0.0)
+        entry = float(entry_price or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0 or target <= entry or entry <= stop:
+        return None
+    return (target - entry) / (entry - stop)
+
+
+def rr_blocked_row(pricing: dict, entry_price, code: str = "", name: str = "") -> dict | None:
+    lim = min_risk_reward()
+    rr = risk_reward_of(pricing, entry_price)
+    if rr is None:
+        # A12：数据缺失 / 目标≤限价 / 止损≥限价 —— 必须 fail-closed。
+        # 最危险的腿恰恰是「没有有效目标或止损」的那只，放行等于闸门形同虚设。
+        return {"code": code, "name": name,
+                "price": (round(float(entry_price), 3)
+                          if entry_price not in (None, "") else None),
+                "risk_reward": None, "limit": lim, "reason": "pricing_missing",
+                "note": "缺目标价/止损价，或目标≤限价、止损≥限价 → 算不出赔率，按闸门拦下"}
+    if rr >= lim - 1e-12:
+        return None
+    return {"code": code, "name": name, "price": round(float(entry_price), 3),
+            "risk_reward": round(rr, 3), "limit": lim,
+            "note": f"赔率 {rr:.2f} < 下限 {lim:.2f}（按限价 {float(entry_price):.2f} 元算）→ 不建仓"}
+
+
+# ------------------------------------------------------------ 场外基金「持有期」过滤（2026-11-25）
+# 解析器在 metrics.hold_period_days（plan 与 otc 共用一份，免得两处正则各写一遍）；
+# 这里只决定「本 plan 用哪个上限」。起因：11-02 买了 018193「180 天持有期」，锁到 2027-05-01。
+hold_period_days = m.hold_period_days
+
+
+def _max_hold_period_days() -> int:
+    otc_cfg = (config.RISK.get("wealth") or {}).get("otc") or {}
+    try:
+        return int(otc_cfg.get("max_hold_period_days") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 # ------------------------------------------------------------------ R2 场外兜底（债券基金）
-# 为什么要有这条腿：5 万本金下 R2 预算约 7,000 元，而一手场内债券 ETF 约 1.1–1.2 万元，
+# 为什么要有这条腿：5 万本金下 R2 预算 2,300 元（2026-11-25 B-11 由 7,000 收到此，见 config.RISK.wealth.otc.budget_cap_cny），而一手场内债券 ETF 约 1.1–1.2 万元，
 # 单只上限 12%×5 万 = 6,000 元 < 一手 → 场内仍然配不出。场外债券基金实测 99.5% 起购
 # ≤10 元、申购费中位数 0（77.6% 为 0）、持有满 90 天赎回费 0（7–30 天档仍收
 # 0.10%–0.75%，见 _otc_fee_rule_txt），是小资金 R2 层
@@ -808,6 +958,7 @@ def load_otc_pool() -> tuple[list[dict], str]:
             return default
 
     rows = []
+    hold_skipped: list[str] = []
     for _, r in df.iterrows():
         code = _txt(r, "code")
         name = _txt(r, "name")
@@ -819,6 +970,17 @@ def load_otc_pool() -> tuple[list[dict], str]:
             continue
         level = _txt(r, "level") or "R2"
         if not level.startswith("R2"):       # 等级不是 R2 的不得进 R2 层（fail-closed）
+            continue
+        # 持有期硬过滤（2026-11-25，A 类）：优先用 otc.py 产出的列，旧池没有该列就从名称解析。
+        # 为什么在 plan 里还要再挡一次：plan 读的是**磁盘上的 CSV**，可能是旧版 otc.py 产物，
+        # 过滤写在 otc.py 只能保证「以后重跑的池干净」，挡不住「今天拿旧池出计划」。
+        hold_days = _num(r, "hold_period_days")
+        if hold_days is None:
+            hold_days = hold_period_days(name)
+        hold_days = int(hold_days) if hold_days else None
+        max_hold = _max_hold_period_days()
+        if max_hold > 0 and hold_days and hold_days > max_hold:
+            hold_skipped.append(f"{code} {name}（{hold_days} 天）")
             continue
         min_purchase = _num(r, "min_purchase", 100.0)
         if min_purchase is None or min_purchase < 0:
@@ -839,6 +1001,7 @@ def load_otc_pool() -> tuple[list[dict], str]:
             "cost_1y": _num(r, "cost_1y"),
             "score": _num(r, "score", 0.0),
             "level": level,
+            "hold_period_days": hold_days,
             "level_reason": _txt(r, "level_reason") or "场外债券基金（R2 固定收益类）",
             "key": _txt(r, "key") or name,
             "share_class": _txt(r, "share_class"),
@@ -847,7 +1010,11 @@ def load_otc_pool() -> tuple[list[dict], str]:
     rows.sort(key=lambda x: (-(x["score"] or 0.0),
                              x["cost_1y"] if x["cost_1y"] is not None else 9.99,
                              x["min_purchase"], x["code"]))
-    return rows, f"场外债券基金候选 {len(rows)} 只（按综合分排序）"
+    note = f"场外债券基金候选 {len(rows)} 只（按综合分排序）"
+    if hold_skipped:
+        note += (f"；已按 config.RISK.wealth.otc.max_hold_period_days={_max_hold_period_days()} 天"
+                 f"剔除持有期更长的 {len(hold_skipped)} 只")
+    return rows, note
 
 
 def check_pool_duplicates(etf_pool: list[dict], otc_pool: list[dict]) -> None:
@@ -925,6 +1092,134 @@ def _otc_unit(e: dict) -> int:
     return int(math.ceil(base / 100.0)) * 100
 
 
+def _norm_pct(v) -> float | None:
+    """把「3.37」与「0.0337」两种写法都归一成小数（|v| > 0.2 视为百分数）。
+
+    为什么需要：otc.py 的 CSV 里 ret_1y/ret_3y/cost_1y 是小数，而 fee 表原始数据是百分数，
+    历史上两处混用过。钱账算的是「几个 bp 的差额」，差 100 倍会得出完全相反的结论。
+    """
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if x != x:          # NaN
+        return None
+    return x / 100.0 if abs(x) > 0.2 else x
+
+
+def _norm_fee_pct(v) -> float | None:
+    """管理费专用归一化：CSV 里 mgmt_fee 是**百分数**（0.13–0.7 表示 0.13%–0.7%）。
+
+    实测 stage1_otc.csv 683 行 mgmt_fee ∈ [0.13, 0.70]，而 ret_3y ∈ [−0.0003, 0.0722] ——
+    同一张表里两种刻度。管理费不可能 >2%，所以用 2% 当分界，比通用 >0.2 稳。
+    """
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if x != x:
+        return None
+    return x / 100.0 if x > 0.02 else x
+
+
+def _otc_fwd_yield() -> tuple:
+    """从国债收益率缓存取 3Y/5Y 最新值（**前瞻票息代理**）；取不到返回 (None, "")。
+
+    实现已下沉到 metrics.fwd_bond_yield()（2026-11-25 B-12）：otc.py 给 R2 池打分用的是
+    同一份口径，两处各写一遍必然漂移（这个函数在本轮之前是 plan.py 私有）。
+    为什么用国债曲线而不是基金历史净值：历史 3 年 CAGR 正好落在债牛里（SKILL §8.11 自己警告过），
+    拿它当预期收益就是把后视镜当挡风玻璃。前瞻能确定的只有「到期收益率」这一项。
+    """
+    try:
+        return m.fwd_bond_yield()
+    except Exception:              # noqa: BLE001 —— 前瞻票息是锦上添花，读不到就降级，不能让计划挂
+        return None, ""
+
+def _otc_money_account(chosen: list[dict], pool: list[dict]) -> dict:
+    """R2 腿的「钱账」：买了它，跟**现金层**（货基）比到底赚多少。
+
+    为什么必须有（A 类，2026-11-25）：SKILL.md:818 承诺 plan 要输出「选中的 3 只各自近 3 年
+    CAGR、加权、全池中位数、**与现金层的差额**、**组合年度增量**」，但 plan.py/otc.py 里
+    grep「增量/差额/现金层净利率」零命中 —— 门槛从来没被计算过，所以 11-02 那 7,000 元
+    是在「不知道它打不打得过货基」的情况下买的（事后来看前瞻净票息 0.958% < 货基 1.09%）。
+    口径：后视（ret_3y 加权，含历史债牛偏差）与前瞻（国债 3/5Y 均值 −管理费）**分开报**，
+    两个都跟 `config.cash_rates()["money_fund"]` 比，并折算成「一年多少钱」。
+    """
+    try:
+        cash = float(config.cash_rates().get("money_fund"))
+    except (AttributeError, TypeError, ValueError):
+        cash = None
+
+    def _wavg(rows: list[dict], key: str) -> float | None:
+        num = den = 0.0
+        for e in rows or []:
+            w = float(e.get("amount") or 0.0)
+            v = _norm_fee_pct(e.get(key)) if key == "mgmt_fee" else _norm_pct(e.get(key))
+            if w <= 0 or v is None:
+                continue
+            num += w * v
+            den += w
+        return (num / den) if den else None
+
+    amt = round(sum(float(e.get("amount") or 0.0) for e in chosen or []), 2)
+    r3 = _wavg(chosen, "ret_3y")
+    op = _wavg(chosen, "mgmt_fee")
+    pool_r3 = None
+    vals = sorted(v for v in (_norm_pct(e.get("ret_3y")) for e in pool or []) if v is not None)
+    if vals:
+        pool_r3 = vals[len(vals) // 2]
+    fwd_gross, fwd_asof = _otc_fwd_yield()
+    fwd_net = (fwd_gross - op) if (fwd_gross is not None and op is not None) else fwd_gross
+    out = {"amount": amt, "cash_rate": cash,
+           "ret_3y_wavg": None if r3 is None else round(r3, 6),
+           "ret_3y_median": None if pool_r3 is None else round(pool_r3, 6),
+           "fwd_yield_proxy": None if fwd_gross is None else round(fwd_gross, 6),
+           "fwd_yield_asof": fwd_asof,
+           "op_fee_wavg": None if op is None else round(op, 6),
+           "fwd_net_rate": None if fwd_net is None else round(fwd_net, 6),
+           # 口径提醒：stage1_otc.csv 只有管理费一列，托管费/销售服务费（合计约 0.05%–0.15%）
+           # 没进 CSV。所以「前瞻净票息」是**偏乐观**的估计，差额接近 0 时不能当成真的赢。
+           "op_fee_note": "前瞻净票息只扣管理费，托管费/销售服务费约 0.05%–0.15% 未扣（偏乐观）"}
+    if cash is not None and amt:
+        if r3 is not None:
+            out["hist_gap_vs_cash"] = round(r3 - cash, 6)
+            out["hist_annual_extra_cny"] = round(amt * (r3 - cash), 2)
+        if fwd_net is not None:
+            out["fwd_gap_vs_cash"] = round(fwd_net - cash, 6)
+            out["fwd_annual_extra_cny"] = round(amt * (fwd_net - cash), 2)
+    # R2 准入线（B 类 #22⑤）：前瞻净票息对货基的**年化**超额 ≥ otc.min_fwd_excess_annual
+    # 才算「值得占 R2 额度」。不达标不等于必须清仓——R2 还承担「小资金唯一 R2 敞口」的
+    # 结构作用（见 pending_changes #24），所以只把它记成 admission.pass=False 并停止加仓。
+    try:
+        _req = float(((config.RISK.get("wealth") or {}).get("otc") or {})
+                     .get("min_fwd_excess_annual"))
+    except (TypeError, ValueError, AttributeError):
+        _req = None
+    if _req is not None:
+        _act = out.get("fwd_gap_vs_cash")
+        out["admission"] = {
+            "required_annual_excess": round(_req, 6),
+            "actual_annual_excess": _act,
+            "pass": bool(_act is not None and _act >= _req),
+            "note": "准入线 = 前瞻年化超额 ≥25bp（≈6.6bp/季）；不达标只保留风险等级所需的最小额度、不再加仓",
+        }
+    gaps = [g for g in (out.get("hist_gap_vs_cash"), out.get("fwd_gap_vs_cash")) if g is not None]
+    _adm_pass = bool((out.get("admission") or {}).get("pass"))
+    _req_txt = (f"（准入线 {_bp(_req)}）" if _req is not None else "")
+    if not gaps:
+        out["verdict"] = "缺数据，无法与现金层比较"
+    elif all(g < 0 for g in gaps):
+        out["verdict"] = f"**打不过现金层**（两个口径都为负）→ 这笔钱放在货基更划算{_req_txt}"
+    elif out.get("fwd_gap_vs_cash") is not None and out["fwd_gap_vs_cash"] < 0:
+        out["verdict"] = f"后视为正（含 3 年债牛）、前瞻为负 → 只能算历史，不能算预期{_req_txt}"
+    elif _req is not None and not _adm_pass:
+        out["verdict"] = (f"前瞻超额 {_bp(out.get('fwd_gap_vs_cash'))} 未过准入线"
+                          f" {_bp(_req)} → 只保留最小额度、不加仓")
+    else:
+        out["verdict"] = "前瞻超额过线 → 站得住"
+    return out
+
+
 def otc_layer(pool: list[dict], budget: float, capital: float,
               single_cap: float) -> dict:
     """场外兜底腿：把 R2 预算按**金额**分到 1–N 只场外债券基金。
@@ -992,6 +1287,7 @@ def otc_layer(pool: list[dict], budget: float, capital: float,
             remain = round(remain - unit, 2)
     out["positions"] = chosen
     out["spent"] = round(spent, 2)
+    out["money_account"] = _otc_money_account(chosen, pool)
     if chosen:
         # 「一手多少钱」不写死（2026-10-30 审计：文档写 1.1–1.2 万、这里硬编码 1.5 万，
         # 同一份计划书里出现两个一手价）。ETF 一手价随行市变，本函数只报「买不起」这一事实。
@@ -1215,7 +1511,7 @@ def build_cash_plan(capital: float, equity_spent: float, reserved: float = None,
 def main():
     ap = argparse.ArgumentParser(description="阶段三：生成执行计划（本部署本金 5 万）")
     ap.add_argument("--detail", default=os.path.join(OUT, "stage2_detail.json"))
-    ap.add_argument("--capital", type=float, default=50000.0,
+    ap.add_argument("--capital", type=float, default=0.0,
                     help=f"可用本金，必须在 {config.CAPITAL['min']:,.0f}–"
                          f"{config.CAPITAL['max']:,.0f} 元之间")
     ap.add_argument("--tier", default=config.CAPITAL["default_tier"],
@@ -1229,6 +1525,12 @@ def main():
     args = ap.parse_args()
 
     try:
+        if not args.capital:  # A6：不传 = 按账本累计投入自动（动态本金会逐月变大）
+            try:
+                import capital_dyn as _cd_auto
+                args.capital = _cd_auto.live_capital()
+            except Exception:  # noqa: BLE001
+                args.capital = 50000.0
         capital = cap.validate_capital(args.capital)
     except cap.CapitalRangeError as e:
         print(f"✗ {e}", file=sys.stderr)
@@ -1289,6 +1591,12 @@ def main():
     if not args.no_wealth:
         wpool, wnote = load_wealth_pool()
         r2_budget = round(equity_budget * r2_target, 2)
+        # 2026-11-25 B-11：R2 腿绝对上限（config.RISK.wealth.otc.budget_cap_cny = 2,300 元）。
+        # 为什么两条口径并存：r2_target 是比例（40% of 权益预算 → 7,000 元），前瞻净票息 0.958%
+        # 打不过货基 1.08%，每多放 1,000 元每年少赚约 1.2 元，且要占 5 元佣金 × 腿数。
+        _r2_cap = float(((config.RISK.get("wealth") or {}).get("otc") or {}).get("budget_cap_cny") or 0.0)
+        if _r2_cap > 0:
+            r2_budget = round(min(r2_budget, _r2_cap), 2)
         # 场外池只作为 R2 的第二条腿：缺失/坏掉都不阻断主流程，note 会写进计划
         otc_pool, otc_note = (([], "未启用（--no-otc）") if args.no_otc
                               else load_otc_pool())
@@ -1324,6 +1632,7 @@ def main():
 
     stock_rows = cap.lot_table(items, capital) if items else []
     positions, orders, unaffordable = [], [], []
+    rr_blocked: list = []   # 赔率闸门拦下的标的（2026-11-25 B 类 #14）
     stock_spent = 0.0
     used_ind: dict = {}
 
@@ -1338,8 +1647,27 @@ def main():
                 "min_capital_3tranche": row["min_capital_3tranche"],
                 "note": row["note"]})
             continue
+        # 金额否决（2026-11-25，A 类）：单票总额太小 → 5 元佣金占比过高，不建（省下名额给后面的票）
+        blocked = cost_blocked_row(row["actual_amount"], False)
+        if blocked:
+            unaffordable.append({
+                "code": row["code"], "name": row["name"],
+                "price": row["price"], "lot_cost": row["lot_cost"],
+                "budget": row["budget"],
+                "min_capital_single": row["min_capital_single"],
+                "min_capital_3tranche": row["min_capital_3tranche"],
+                "note": blocked["note"]})
+            continue
         pr, x = r.get("pricing") or {}, r.get("metrics") or {}
         pl, pstate = price_ladder(r)
+        # 赔率闸门（2026-11-25 B 类 #14）：按**第 1 批限价**算，<1.5 不建这条腿。
+        # 按现价算会把「等回调再买」错判成「追高」：同一只票按现价 25.40 买赔率 1.84，
+        # 按限价 22.21 买是 4.29。
+        _rr_bad = rr_blocked_row(pr, (pl[0].get("price") if pl else None),
+                                 row["code"], row["name"])
+        if _rr_bad:
+            rr_blocked.append(_rr_bad)
+            continue
         ll = cap.lot_ladder(row)
         ladder = []
         for pstep, lstep in zip(pl, ll):
@@ -1392,6 +1720,7 @@ def main():
     if not args.no_etf:
         pool, pool_note = load_etf_pool()
         etf_budget = max(0.0, round(r3_budget - stock_spent, 2))
+        # ETF 只数档位按「权益预算 / 本金」比例定（分母用 capital，与 ETF_N_BY_RATIO 一致）
         etf_res = etf_layer(pool, etf_budget, capital, used_ind,
                             etf_budget_ratio=etf_budget / capital if capital else 0.0)
         etf_res["pool_note"] = pool_note
@@ -1526,6 +1855,24 @@ def main():
         review["note"] = "本期无持仓（所有候选被否决或买不起）→ 无新订单，不是「评审通过」"
         orders = []
 
+    # ---- 单笔成本率最终闸门（2026-11-25，A 类修复）----
+    # 三条腿（个股 ladder / ETF 手数 / 场外金额）各算各的金额，上面两处只是「早判」；
+    # 这里对**最终 orders 列表**再兜一次，保证任何代码路径都不会漏出「5 元佣金占比超限」的碎单。
+    # 为什么要在 risk 评审把 orders 清零**之后**：清零是因为评审 fail-closed，与本闸门无关；
+    # 放在前面会让被清零的订单又回到列表里。
+    cost_blocked = []
+    _kept_orders = []
+    for o in orders:
+        _amt = float(o.get("amount") or 0.0)
+        _etf = bool(o.get("is_etf"))
+        blocked = cost_blocked_row(_amt, _etf) or roundtrip_blocked_row(_amt, _etf)
+        if blocked:
+            cost_blocked.append({"layer": o.get("layer"), "code": o.get("code"),
+                                 "name": o.get("name"), **blocked})
+        else:
+            _kept_orders.append(o)
+    orders = _kept_orders
+
     # ---- 费用测算 ----
     fees = cap.fee_summary(orders, capital)
 
@@ -1534,6 +1881,8 @@ def main():
         "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
         "capital": capital,
         "capital_check": cap.describe(capital),
+        "cost_blocked": cost_blocked,
+        "rr_blocked": rr_blocked,
         "tier": tier,
         "rule_override": bool(args.override_regime and tier["tier_ratio"] > tier["regime_cap"]),
         "market_regime": regime,
@@ -1696,6 +2045,31 @@ def to_markdown(plan: dict) -> str:
                      f"{u['budget']:,.0f} | {u['min_capital_single']:,.0f} |")
         L += ["", "> 结论：这些标的不是被策略否掉，而是「1 手金额 > 单票预算」。"
               "要么加本金到上表最后一列，要么用 ETF 承接同一份权益暴露。", ""]
+    # ---- 成本闸门（2026-11-25，A 类）：被挡下的单要看见，否则会被误读成「策略不看好」----
+    _blocked = plan.get("cost_blocked") or []
+    if _blocked:
+        L += ["### 被「单笔成本率」拦下的单（不是买不起，是佣金吃掉太多）", "",
+              "| 层 | 代码 | 名称 | 金额 | 佣金占比 | 上限 |", "|---|---|---|---|---|---|"]
+        for b in _blocked:
+            L.append(f"| {b.get('layer') or '—'} | {b.get('code') or '—'} | "
+                     f"{b.get('name') or '—'} | {(b.get('amount') or 0):,.2f} | "
+                     f"{(b.get('ratio') or 0):.2%} | {(b.get('limit') or 0):.2%} |")
+        L += ["", f"> 规则：单笔买入的 5 元最低佣金占比 > `config.CAPITAL"
+              f".commission_ratio_block = {(cost_block_limit()):.2%}` 就不下单。"
+              "起因是 10-29 那笔 574.40 元的 sh510050（0.87%），是「计划建议 800 元下限」"
+              "没被当成执行闸门导致的。", ""]
+
+    # ---- 赔率闸门（2026-11-25，B-14）：被拦下的单同样要看见，否则会被当成「策略不看好」----
+    _rr = plan.get("rr_blocked") or []
+    if _rr:
+        L += ["### 被「赔率」拦下的单（按第 1 批限价算的上行/下行 < 下限）", "",
+              "| 代码 | 名称 | 限价 | 赔率 | 下限 | 说明 |", "|---|---|---|---|---|---|"]
+        for b in _rr:
+            L.append(f"| {b.get('code') or '—'} | {b.get('name') or '—'} | "
+                     f"{b.get('price')} | {b.get('risk_reward')} | {b.get('limit')} | "
+                     f"{b.get('note') or ''} |")
+        L += ["", f"> 规则：`config.EXEC.min_risk_reward` = {min_risk_reward():.2f}"
+              "（(目标价 − 限价) ÷ (限价 − 止损价)，按第 1 批限价算）。", ""]
 
     L += ["## 四、ETF 层（承接个股买不了的预算）", "",
           f"- {plan['etf_layer'].get('pool_note', '')}",
@@ -1758,6 +2132,29 @@ def to_markdown(plan: dict) -> str:
               "「提交日的下一交易日累计净值」成交、T+1 确认；市值为「投入 × 累计净值比」，"
               "赎回费按持有天数取实测档。真实下单请在基金 APP 按上表金额申购，"
               "APP 的确认净值与确认日通常比账本晚 1–2 个交易日。", ""]
+        # ---- 钱账（2026-11-25，A 类）：SKILL.md:818 承诺过，此前根本没算 ----
+        _ma = ((plan.get("otc_layer") or {}).get("summary") or {}).get("money_account") or {}
+        if _ma:
+            _cr = _ma.get("cash_rate") or 0.0
+            L += ["### 这笔钱跟现金层（货基）比，到底赚多少", "",
+                  "| 口径 | 年化收益率 | 与货基差额 | 一年折多少钱 |", "|---|---|---|---|"]
+            if _ma.get("ret_3y_wavg") is not None:
+                L.append(f"| 后视：加权近 3 年 CAGR（含债牛） | {_ma['ret_3y_wavg']:.2%} | "
+                         f"{(_ma.get('hist_gap_vs_cash') or 0.0):+.2%} | "
+                         f"{(_ma.get('hist_annual_extra_cny') or 0.0):+,.2f} 元 |")
+            if _ma.get("fwd_net_rate") is not None:
+                L.append(f"| 前瞻：国债 3/5Y 均值 {(_ma.get('fwd_yield_proxy') or 0):.2%} "
+                         f"− 管理费 {(_ma.get('op_fee_wavg') or 0):.2%} | "
+                         f"{_ma['fwd_net_rate']:.2%} | "
+                         f"{(_ma.get('fwd_gap_vs_cash') or 0.0):+.2%} | "
+                         f"{(_ma.get('fwd_annual_extra_cny') or 0.0):+,.2f} 元 |")
+            L += ["",
+                  f"- 现金层（货基）基准 **{_cr:.2%}**；全池近 3 年 CAGR 中位数 "
+                  f"{(_ma.get('ret_3y_median') or 0):.2%}；本腿投入 {(_ma.get('amount') or 0):,.0f} 元",
+                  f"- 判断：{_ma.get('verdict', '')}"]
+            if _ma.get("op_fee_note"):
+                L.append(f"- 口径说明：{_ma['op_fee_note']}")
+            L.append("")
     for u in wl.get("unaffordable", []) or []:
         L.append(f"- {u['sym']} {u['name']}：{u['note']}（需本金 ≥ "
                  f"{u.get('min_capital_single', 0):,.0f} 元）")
@@ -1778,7 +2175,7 @@ def to_markdown(plan: dict) -> str:
         if _r3 and _d3:
             _risk_txt = (f"（所选 {len(_r3)} 只近 3 年年化 {min(_r3) * 100:.2f}%–{max(_r3) * 100:.2f}%、"
                          f"3 年最大回撤最深 {min(_d3) * 100:.2f}%）")
-        L += ["> 为什么这次用场外债券基金当「理财产品」：5 万本金下 R2 预算约 7,000 元，"
+        L += ["> 为什么这次用场外债券基金当「理财产品」：5 万本金下 R2 预算 2,300 元（硬上限；2026-11-25 B-11 依据：前瞻净票息 0.958% < 货基 1.08%，多放一年是亏的），"
               "而一手场内债券 ETF 约 1.1–1.2 万元、单只上限 12%×5 万 = 6,000 元 < 一手 → 场内配不出。"
               f"本次所选 {len(otcp)} 只：{_otc_fee_range_txt(otcp)}、{_otc_fee_txt(otcp)}"
               "（费用已计入 otc.py 的 cost_1y 口径）；场外债基起购门槛通常只有 10 元"
@@ -1919,7 +2316,7 @@ def to_markdown(plan: dict) -> str:
           "- 等级分布：" + ("／".join(f"{lv} {w * 100:.0f}%"
                                      for lv, w in (rv.get("weights") or {}).items()) or "—")
           + f"；R2 占比 {float(rv.get('r2_share') or 0) * 100:.1f}%"
-            f"（目标 {float(rv.get('r2_target') or 0) * 100:.0f}%）",
+            f"（目标 {float(rv.get('r2_target') or 0) * 100:.0f}%，另受硬上限 2,300 元约束 → 实际约 13%）",
           f"- 按风险等级筛掉的候选 **{len(plan.get('risk_filter') or [])} 只**（明细见下）", ""]
     if rv.get("violations"):
         L += ["**违规（必须处理；本期订单已清空）**："] + [f"- {x}" for x in rv["violations"]] + [""]
@@ -1953,6 +2350,11 @@ def to_markdown(plan: dict) -> str:
 # ------------------------------------------------------------------ 小工具
 def _etf_val(p: dict, key: str):
     return (p.get("etf_metrics") or {}).get(key)
+
+
+def _bp(v) -> str:
+    """百分点很小（如 R2 准入的 25bp）时用基点显示，避免四舍五入成 +0.2%/0.0%。"""
+    return "—" if v is None else f"{v * 10000:+.1f}bp"
 
 
 def _pct(v) -> str:

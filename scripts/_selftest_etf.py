@@ -124,18 +124,33 @@ def test_shared_helper_is_single_source():
 
 
 def test_wealth_uses_etf_prefix():
-    """wealth.py 从新浪 ETF 全表拿的是裸代码，必须补前缀再取历史（2026-11-16 511360 事故）。"""
+    """wealth.py 从新浪 ETF 全表拿的是裸代码，必须补前缀再取历史（2026-11-16 511360 事故）。
+
+    2026-11-26 审计 A1：run_screen 会把结果写进 wealth.OUT（生产 out/），
+    自检必须把 OUT 指到临时目录、且不落 provenance，否则每次 --fast 都清空生产 R2 池。
+    """
+    import shutil
+    import tempfile
+
     import wealth
     spot = pd.DataFrame({"代码": ["511360", "159649"], "名称": ["短融ETF", "国债ETF"],
                          "成交额": [8.0e8, 8.0e8]})
     seen = []
+    out_tmp = tempfile.mkdtemp(prefix="etf_wealth_out_")
     old_spot, old_hist = wealth.ds.fetch_etf_spot, wealth.ds.fetch_etf_hist
+    old_out, old_dump = wealth.OUT, wealth.ds.dump_provenance
     wealth.ds.fetch_etf_spot = lambda: spot
     wealth.ds.fetch_etf_hist = lambda sym: (seen.append(sym), None)[1]
+    wealth.OUT = out_tmp
+    wealth.ds.dump_provenance = lambda *a, **k: None
     try:
         wealth.run_screen(verbose=False)
     finally:
         wealth.ds.fetch_etf_spot, wealth.ds.fetch_etf_hist = old_spot, old_hist
+        wealth.OUT, wealth.ds.dump_provenance = old_out, old_dump
+    ck("wealth 筛选产物写在隔离目录（不污染生产 out/）",
+       os.path.isfile(os.path.join(out_tmp, "stage1_wealth.csv")), out_tmp)
+    shutil.rmtree(out_tmp, ignore_errors=True)
     ck("wealth 沪市基金补 sh 前缀", "sh511360" in seen, str(seen))
     ck("wealth 深市基金补 sz 前缀", "sz159649" in seen, str(seen))
     ck("wealth 不再把裸代码喂给数据层", "511360" not in seen and "159649" not in seen, str(seen))

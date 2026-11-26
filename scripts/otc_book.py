@@ -41,10 +41,16 @@ ORDER_KEY = "otc_orders"
 
 LAYER = "理财(R2)"
 LEVEL = "R2"
+# 赎回费口径（2026-11-25 A 类修复前后都保留这两个常量，因为**费表取不到时**仍要退回保守假设）：
+# `HOLD_DAYS` = 「满这么久就用实测长期档」；`SHORT_FEE` = 「费表不可用时的最严档假设」。
+# 旧实现把这两个当成**唯一规则**（持有 <90 天一律 1.5%），与实测费表矛盾：011984 满 7 天就是 0，
+# 巡检却把 2,300 元标成「赎回费 34.5 元、别动」。现在改为**按实际持有天数查实测阶梯**
+# （见 redeem_fee_rate / _redeem_ladder），这两个常量降级为兜底。
 HOLD_DAYS = 90          # 赎回费持有期阈值：满 90 天用实测档（多为 0），不足按最严档罚
-SHORT_FEE = 0.015       # 不足 90 天的保守赎回费率（7 天内最严档 1.5%）
+SHORT_FEE = 0.015       # 费表不可用时的保守赎回费率（7 天内最严档 1.5%）
 MIN_TRADE = 100.0       # 单笔申购/赎回最小金额：低于 100 元不折腾（场外 10 元起，但没必要）
 MN_AMOUNT = 10.0        # 场外最低申购金额兜底（plan 里通常给 10 元）
+_LADDER_CACHE: dict = {}
 
 
 def ensure(state: dict) -> dict:
@@ -200,6 +206,42 @@ def mark(state: dict, nav_map: dict) -> dict:
     return out
 
 
+def refresh_navs(state: dict, as_of: str = None) -> int:
+    """刷新场外持仓的累计净值（巡检/执行结算共用一个入口），返回刷新只数。
+
+    为什么必须共用：`patrol.mark_daily` 与 `paper_exec` 都要在 settle 前刷新场外净值；
+    两边各写一遍必然漂移 —— 2026-11-24 同一天 patrol 结算 49,869.84、paper_exec
+    结算 49,871.64，差的 1.80 元就是「一边刷了场外净值、一边没刷」。
+    取不到就跳过（沿用账本旧值），失败不抛错（场外净值不该拖垮盯市）。
+    """
+    ensure(state)
+    codes = sorted(str(c) for c in state[HOLD_KEY])
+    if not codes:
+        return 0
+    import datasource as ds          # 延迟导入：离线自检不该拉起数据层
+    navs = {}
+    for code in codes:
+        try:
+            df = ds.fetch_fund_nav_history(short_code(code), "累计净值走势")
+        except Exception:            # noqa: BLE001 - 取不到就沿用旧净值
+            continue
+        if df is None or len(df) == 0:
+            continue
+        try:
+            series_ = [(str(d)[:10], float(v)) for d, v in zip(df["date"], df["value"])]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if as_of:
+            cut = [x for x in series_ if x[0] <= str(as_of)]
+            series_ = cut or series_
+        if series_:
+            navs[code] = series_
+    if not navs:
+        return 0
+    mark(state, navs)
+    return len(navs)
+
+
 def market_value(state: dict) -> float:
     ensure(state)
     return round(sum(mv_of(h) for h in state[HOLD_KEY].values()), 2)
@@ -225,12 +267,57 @@ def fees_total(state: dict) -> float:
     return round(sum(float(t.get("fee") or 0.0) for t in state[TRADE_KEY]), 2)
 
 
+def _redeem_ladder(h: dict):
+    """实测赎回费阶梯 (periods, fees)；取不到 → None。带进程内缓存（同一份周报会问 N 次）。
+
+    注意 code 要去掉 `OTC:` 前缀：账本里持仓键是 `OTC:011984`，而费表/取数接口只认 6 位代码
+    （第一版忘了剥前缀，结果三只全判「费表不可用」、退回 1.5% —— 静默错误，看起来还像保守）。
+    """
+    code = str(h.get("code") or "").split(":")[-1].strip()
+    if not code:
+        return None
+    if code not in _LADDER_CACHE:
+        try:
+            import otc as _otc       # 懒 import：otc.py **不** import otc_book，因此无循环依赖
+            _LADDER_CACHE[code] = _otc.redeem_ladder(code)
+        except Exception:            # noqa: BLE001 —— 费表取不到就退回保守假设，绝不让报表挂
+            _LADDER_CACHE[code] = ([], [])
+    periods, fees = _LADDER_CACHE[code]
+    return (periods, fees) if periods else None
+
+
 def redeem_fee_rate(h: dict, day: str) -> float:
-    """按持有天数给赎回费率：满 90 天用实测档（多为 0），不足按最严档保守罚。"""
-    held = _days(h.get("buy_date") or day, day)
+    """按**实际持有天数**取实测赎回费档（小数）。
+
+    2026-11-25 A 类修复：旧实现是「持有 <90 天一律 max(1.5%, 满90天档)」—— 与实测费表直接矛盾
+    （011984 满 7 天就是 0%），巡检据此把 2,300 元持仓标成「赎回要付 34.5 元」，把「随时可赎」
+    误报成「别动」。现在：有实测阶梯就按阶梯查（与 otc.py 选池用**同一个** redeem_fee_at_hold），
+    取不到费表才退回 HOLD_DAYS/SHORT_FEE 的保守假设。
+    """
+    # held 可能为负：老账本里 `nav_date` 比 `buy_date` 还早（净值停在买入前），
+    # 直接拿去做阶梯查询会一档都不命中、落到 min(费率)=0 的假「免费」上。钳到 0 = 按最短档算。
+    held = max(0, _days(h.get("buy_date") or day, day))
+    fallback = float(h.get("redeem_fee_hold") or 0.0)
+    ladder = _redeem_ladder(h)
+    if ladder:
+        try:
+            import otc as _otc
+            rate = _otc.redeem_fee_at_hold(ladder[0], ladder[1], hold_days=held)
+            if rate is not None:
+                return rate / 100.0
+        except Exception:            # noqa: BLE001
+            pass
     if held >= HOLD_DAYS:
-        return float(h.get("redeem_fee_hold") or 0.0)
-    return max(SHORT_FEE, float(h.get("redeem_fee_hold") or 0.0))
+        return fallback
+    return max(SHORT_FEE, fallback)
+
+
+def redeem_fee_basis(h: dict, day: str) -> str:
+    """赎回费是「实测档」还是「最严档假设」——报表必须标出来，否则读者没法判断可信度。"""
+    if _redeem_ladder(h):
+        held = _days(h.get("buy_date") or day, day)
+        return f"实测档（持有 {held} 天）"
+    return "最严档假设（费表不可用）"
 
 
 # ------------------------------------------------------------------ 成交
@@ -325,6 +412,58 @@ def resolve(state: dict, as_of: str, nav_map: dict) -> list:
 
 
 # ------------------------------------------------------------------ 按计划下单
+_LOCK_CACHE: dict = {}
+
+
+def product_lock_days(code: str, name: str = "") -> int:
+    """产品「持有期」天数（天）：从 out/stage1_otc.csv 的 hold_period_days 列取。
+
+    为什么需要：018193 是「180 天持有期」产品（买入 2026-11-02，锁到 2027-05-01），
+    而目标里把它换掉时，	arget_orders 会直接生成「赎回」单 —— 持有人在锁定期内根本
+    赎不了。这里把产品条款里写的持有期读进来，未到期就不生成赎回单（留到解禁后再换）。
+    取不到列/读不到文件 → 0（不阻断，退回旧行为）。
+    """
+    c = str(code or "").split(":")[-1]
+    if not c:
+        return 0
+    key = c + "|" + str(name or "")
+    if key in _LOCK_CACHE:
+        return _LOCK_CACHE[key]
+    days = 0
+    try:
+        import os
+        import pandas as pd
+        path = os.path.join(config.OUT_DIR, "stage1_otc.csv")
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            if "hold_period_days" in df.columns and "code" in df.columns:
+                hit = df[df["code"].astype(str).str.strip() == c]
+                if len(hit):
+                    v = hit.iloc[0]["hold_period_days"]
+                    if v == v and v not in (None, ""):   # NaN 过滤
+                        days = int(float(v))
+    except Exception:  # noqa: BLE001 — 条款读不到不阻断下单
+        days = 0
+    if days <= 0 and name:
+        # CSV 还没有 hold_period_days 列（旧产物）→ 从基金名解析：「建信鑫弘180天持有期」
+        try:
+            import metrics
+            days = int(metrics.hold_period_days(name) or 0)
+        except Exception:  # noqa: BLE001
+            days = 0
+    _LOCK_CACHE[key] = days
+    return days
+
+
+def _lock_left(h: dict, day: str) -> int:
+    """还要持有多少天才到产品持有期（<=0 表示已过持有期）。"""
+    lock = product_lock_days(str(h.get("code") or ""), str(h.get("name") or ""))
+    if lock <= 0:
+        return 0
+    held = _days(h.get("buy_date") or day, day)
+    return int(lock - held)
+
+
 def target_orders(state: dict, as_of: str, effective_from: str, wealth: list,
                   nav_map: dict, cash_available: float, allow: bool = True,
                   min_trade: float = MIN_TRADE) -> list:
@@ -346,6 +485,9 @@ def target_orders(state: dict, as_of: str, effective_from: str, wealth: list,
             continue
         mv = mv_of(state[HOLD_KEY][code])
         if mv < min_trade:
+            continue
+        # 产品持有期未到 → 不能赎（2026-11-25 B-11 配套：018193 锁到 2027-05-01）
+        if _lock_left(state[HOLD_KEY][code], as_of) > 0:
             continue
         cum_now = nav_at((nav_map or {}).get(code) or [], as_of)[1]
         out.append(make(state, as_of, effective_from, code,
@@ -372,7 +514,8 @@ def target_orders(state: dict, as_of: str, effective_from: str, wealth: list,
                                 reason=f"场外腿补到目标 {want:,.0f} 元（当前 {cur:,.0f}）",
                                 min_purchase=r.get("min_purchase")))
                 avail = max(0.0, avail - amt)
-        elif delta <= -min_trade and code not in _placed(state, "sell"):
+        elif (delta <= -min_trade and code not in _placed(state, "sell")
+              and _lock_left(h or {}, as_of) <= 0):
             out.append(make(state, as_of, effective_from, code, r.get("name"), "sell",
                             -delta, nav_ref=r.get("unit_nav"),
                             nav_ref_date=r.get("nav_date"),
@@ -397,6 +540,8 @@ def holdings_rows(state: dict) -> list:
             "unrealized": round(mv - cost, 2),
             "unrealized_pct": round(mv / cost - 1, 6) if cost else None,
             "redeem_fee": redeem_fee_rate(h, h.get("nav_date") or h.get("buy_date") or "9999-12-31"),
+            "redeem_fee_basis": redeem_fee_basis(
+                h, h.get("nav_date") or h.get("buy_date") or "9999-12-31"),
             "hold_days": _days(h.get("buy_date") or h.get("nav_date"), h.get("nav_date")),
         })
     return rows

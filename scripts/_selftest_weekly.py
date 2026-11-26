@@ -13,7 +13,9 @@
 
 跑法：python scripts/_selftest_weekly.py（离线）
 """
+import atexit
 import os
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -238,8 +240,125 @@ def t_industry_cap_block():
         # 无上限（0）时不拦截
         kept4, blocked4 = _w.industry_cap_block(orders, state, close, 0.0)
         check("权益上限为 0 时不做拦截（旧产物兜底）", len(kept4) == 3 and not blocked4)
+        # 2026-11-26（A 类）：本期新单已由 target_orders 登记进 state["orders"]，
+        # 扫描挂单时不能把它自己再算一遍（否则额度翻倍、买单被静默误拦）
+        _self1 = {"id": "o1", "code": "000999", "name": "华润三九", "kind": "stock",
+                  "action": "buy", "shares": 100, "limit_price": 30.0,
+                  "created": "2026-11-25"}
+        _st1 = {"holdings": [], "orders": [dict(_self1)], "events": []}
+        kept5, blocked5 = _w.industry_cap_block([_self1], _st1, {"000999": 30.0}, 20000.0)
+        check("行业额度不重复计算本期新单自身（3,000 ≤ 5,000 应保留）",
+              len(kept5) == 1 and not blocked5, str(blocked5))
+        # 被拦下的买单要就地取消，否则账本留幽灵挂单、报告说已拦
+        _self2 = {"id": "o2", "code": "000999", "name": "华润三九", "kind": "stock",
+                  "action": "buy", "shares": 100, "limit_price": 30.0,
+                  "created": "2026-11-25"}
+        _st2 = {"holdings": [], "orders": [dict(_self2)], "events": []}
+        _k2, _b2 = _w.industry_cap_block([_self2], _st2, {"000999": 30.0}, 10000.0)
+        check("被拦的买单就地取消（status=cancelled + cancel_reason）",
+              not _k2 and _self2.get("status") == "cancelled"
+              and "上限" in _self2.get("cancel_reason", ""), str(_self2))
+        # 2026-11-26（A 方案，用户拍板）：分母统一为**本金**，不再用权益层上限。
+        # 5 万本金 → 行业上限 12,500 元；防守档 17,500 元权益时的 4,412 元买单应放行。
+        _o3 = {"id": "o3", "code": "002648", "name": "卫星化学", "kind": "stock",
+               "action": "buy", "shares": 200, "limit_price": 22.06, "ref_price": 22.06,
+               "created": "2026-11-25"}
+        _st3 = {"holdings": [], "orders": [dict(_o3)], "events": [],
+                "meta": {"capital": 50000.0}}
+        _k3, _b3 = _w.industry_cap_block([_o3], _st3, {"002648": 22.7})
+        check("行业上限分母=本金（50,000×25%=12,500，4,412 元买单放行）",
+              len(_k3) == 1 and not _b3, str(_b3))
+        # 已经占了 9,000 元同行业 → 再买 4,000 元 = 13,000 > 12,500 才拦
+        _o4 = {"id": "o4", "code": "002648", "name": "卫星化学", "kind": "stock",
+               "action": "buy", "shares": 200, "limit_price": 20.0, "created": "2026-11-25"}
+        _st4 = {"holdings": [], "events": [],
+                "orders": [dict(_o4),
+                           {"id": "o9", "code": "600276", "kind": "stock",
+                            "action": "buy", "status": "pending",
+                            "shares": 180, "limit_price": 50.0,
+                            "created": "2026-11-25"}],
+                "meta": {"capital": 50000.0}}
+        _k4, _b4 = _w.industry_cap_block([_o4], _st4, {"002648": 20.0, "600276": 50.0})
+        check("本金分母下仍能拦超限（9,000+4,000 > 12,500）",
+              any(o["code"] == "002648" for o in _b4), str(_b4))
     finally:
         _w.industry.load_map = saved
+
+
+def t_week_skill_cost():
+    """上周技能花费（实扣）：只统计 recorded_at 落在 [as_of-6, as_of] 的已入账 run。"""
+    import json
+    import tempfile
+
+    import billing as _b
+
+    print("[6] 上周技能花费（实扣）")
+    tmp = tempfile.mkdtemp(prefix="weekly_skillcost_")
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
+    saved = _b.BUDGET_JSON
+    try:
+        _b.BUDGET_JSON = os.path.join(tmp, "budget.json")
+        doc = {"version": 1, "ledgers": {"50k": {
+            "base_cny": 150.0, "bonus_in_cny": 0.0, "capital": 50000.0,
+            "carry_over_cny": 0.0, "remaining_cny": 150.0, "spent_cny": 0.0,
+            "runs": [
+                {"recorded_at": "2026-11-20 20:00:47", "cost_cny": 0.12,
+                 "source": "task-window", "note": "每日巡检"},
+                {"recorded_at": "2026-11-26 20:00:47", "cost_cny": 0.90,
+                 "source": "task-window", "note": "每日巡检"},
+                {"recorded_at": "2026-11-21 20:00:28", "cost_cny": 1.20,
+                 "source": "events-cycle", "note": "决策"},
+                {"recorded_at": "2026-11-19 20:00:00", "cost_cny": 0.50,
+                 "source": "flat", "note": "旧定额"},
+                {"recorded_at": "", "cost_cny": 9.99, "source": "flat", "note": "坏时间"},
+            ]}}}
+        with open(_b.BUDGET_JSON, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        sc = weekly.week_skill_cost("50k", "2026-11-26")
+        check("区间为 as_of-6 ~ as_of", sc["since"] == "2026-11-20" and sc["until"] == "2026-11-26",
+              str((sc["since"], sc["until"])))
+        check("只计区间内 run 的合计（0.12+0.90+1.20=2.22）",
+              abs(sc["cost_cny"] - 2.22) < 1e-9, str(sc["cost_cny"]))
+        check("运行次数 3", sc["runs"] == 3, str(sc["runs"]))
+        check("区间外（11-19）与坏时间行不计入",
+              all(it["date"] in ("2026-11-20", "2026-11-21", "2026-11-26") for it in sc["items"]),
+              str(sc["items"]))
+        # 表格行：金额与次数、以及无数据时的占位
+        row = weekly.skill_cost_row(sc)
+        check("该行写明金额与次数", "2.22 元" in row and "3 次运行" in row, row)
+        check("无数据时给占位、不猜数", "—" in weekly.skill_cost_row(None))
+        check("无数据时占位不出现金额", "0.00 元" not in weekly.skill_cost_row(None))
+    finally:
+        _b.BUDGET_JSON = saved
+
+
+def t_plan_date_guard():
+    print("plan_date_guard（A5 data_as_of 闸门）")
+    check("同日放行", weekly.plan_date_guard("2026-11-26", "2026-11-26", False) == "")
+    check("空数据日放行（旧产物）", weekly.plan_date_guard("", "2026-11-26", False) == "")
+    m = weekly.plan_date_guard("2026-11-27", "2026-11-26", False)
+    check("数据日晚于决策日→拒绝", "未来数据" in m, m)
+    m = weekly.plan_date_guard("2026-11-25", "2026-11-26", False)
+    check("数据日落后→拒绝", "落后" in m, m)
+    m = weekly.plan_date_guard("2026-11-26", "2026-10-24", True)
+    check("回填历史日→拒绝", "回填" in m, m)
+
+
+def t_next_fill_day():
+    print("next_fill_day（交易日历 vs 周末近似）")
+    import report_html as RH
+    _old = RH._CAL_CACHE
+    try:
+        RH._CAL_CACHE = ["2026-09-30", "2026-10-09", "2026-11-27", "2026-11-30"]
+        check("长假：决策日 09-30 → 下一交易日 10-09",
+              RH.next_fill_day("2026-09-30") == "2026-10-09", str(RH.next_fill_day("2026-09-30")))
+        check("周末：决策日 11-27（周五）→ 11-30（周一）",
+              RH.next_fill_day("2026-11-27") == "2026-11-30", str(RH.next_fill_day("2026-11-27")))
+        RH._CAL_CACHE = []
+        check("无日历：退化为只跳周末（长假会错，文档标注近似）",
+              RH.next_fill_day("2026-09-30") == "2026-10-01", str(RH.next_fill_day("2026-09-30")))
+    finally:
+        RH._CAL_CACHE = _old
 
 
 def main():
@@ -248,6 +367,9 @@ def main():
     t_period_snapshot()
     t_backup_history()
     t_industry_cap_block()
+    t_week_skill_cost()
+    t_plan_date_guard()
+    t_next_fill_day()
     print(f"\n结果：通过 {PASS} 项，失败 {FAIL} 项")
     return 0 if FAIL == 0 else 1
 

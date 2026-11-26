@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import atexit
 import os
 import shutil
 import sys
@@ -256,6 +257,7 @@ def t_grid() -> None:
 
 def _write_grid_csv(closes: list[float]) -> str:
     p = os.path.join(tempfile.mkdtemp(prefix="team_grid_"), "px.csv")
+    atexit.register(shutil.rmtree, os.path.dirname(p), ignore_errors=True)
     with open(p, "w", encoding="utf-8") as f:
         f.write("code,date,close\n")
         for i, c in enumerate(closes):
@@ -609,7 +611,7 @@ def t_stage() -> None:
          team._csv_rows, team.run) = _orig_ing
     ck("T4 之后指向 T9", _r4.get("next") == "T9", _r4)
     ck("T4 提示先 weekly 再 T9", "weekly.py" in (_r4.get("hint") or ""), _r4)
-    ck("T4 提示说明评分在月报", "月报" in (_r4.get("hint") or ""), _r4)
+    ck("T4 提示说明评分在年报", "年报" in (_r4.get("hint") or ""), _r4)
 
     old = config.OUT_DIR
     tmp = tempfile.mkdtemp(prefix="team_stage_")
@@ -665,7 +667,7 @@ def t_data() -> None:
             f.write("{broken json")
         ck("产物损坏 → 回退今天", team.product_ref_date(today) == today)
 
-        # check_data 用参考日判新鲜度：周五生成的产物在周六决策日不该被判过期
+        # check_data 用参考日判新鲜度：周五生成的产物在决策日不该被判过期
         with open(p, "w", encoding="utf-8") as f:
             json.dump({"data_as_of": "2026-11-20"}, f)
         import time as _time
@@ -678,7 +680,7 @@ def t_data() -> None:
         os.utime(p, (_ts, _ts))
         _d = team.check_data()
         ck("T0 参考日 = 2026-11-20", _d.get("ref_date") == "2026-11-20", _d.get("ref_date"))
-        ck("周五产物在周六决策日 → 新鲜（不再误杀）", _d.get("ok") is True, _d.get("stale"))
+        ck("周五产物在决策日 → 新鲜（不再误杀）", _d.get("ok") is True, _d.get("stale"))
         os.utime(os.path.join(tmp, "stage2_judged.csv"), (_ts - 3 * 86400, _ts - 3 * 86400))
         _d2 = team.check_data()
         ck("早于参考日的产物 → 仍判过期", _d2.get("ok") is False and

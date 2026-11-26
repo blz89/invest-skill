@@ -2,10 +2,11 @@
 """每日巡检（纯代码、0 token）：把「已投资项目的交易情况」列成一张表。
 
 为什么要有这个文件：
-  决策每周只做一次（周六 20:00），但持仓每天都要盯——跌破止损、单票/行业超限、
+  决策每周两次（周三、周六 20:30），持仓每天都要盯——跌破止损、单票/行业超限、
   挂单过期、场外净值陈旧、回撤熔断。这些**全是确定性判断**，不该花 token 让模型
-  每天读原始数据。所以巡检做成纯代码：每个交易日 20:00 由 DSH 巡检会话跑一次（取数已由 19:00 本机任务完成），只出清单；
-  要不要为明天开盘减仓，由 Lead 看着清单判断。
+  每天读原始数据。所以巡检做成纯代码：每个交易日 20:00 由 DSH 巡检会话先跑 paper_exec.py
+  撮合「已触发」的条件单（止损/限价买，未触发继续挂），再跑本文件，只出清单；
+  除止损价被击穿（或熔断）外不做任何调仓，其余告警留到决策日处理。
 
 日期口径（2026-10-31 定）：
   默认 `--date auto` = **最近一个交易日**（≤ 今天）。20:00 跑不跨日；即便被推迟到
@@ -35,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config  # noqa: E402
 import datasource  # noqa: E402
+import etf  # noqa: E402
 import industry  # noqa: E402
 import otc_book  # noqa: E402
 import paper  # noqa: E402
@@ -198,6 +200,22 @@ def _atr14_map() -> dict:
     return out
 
 
+def _is_broad_etf(p: dict) -> bool:
+    """宽基/策略 ETF：不占行业额度，也不参与「未分类」占比告警（本身没有行业字段）。
+
+    2026-11-23 A 类修复：行业集中度原来把所有无行业字段的持仓都算「未分类」，
+    上证50ETF（宽基）因此被误报成「行业映射缺失 22.3%」。宽基/策略 ETF 按
+    config.PAPER 的行业注释本来就不占行业额度，应从集中度口径里排除；
+    行业类 ETF 仍照常计入（缺映射时该报的「未分类」照报）。
+    """
+    if str(p.get("layer") or "") != "ETF":
+        return False
+    try:
+        return etf.classify(str(p.get("name") or "")) in ("宽基", "策略")
+    except Exception:                               # noqa: BLE001 - 分类失败不影响巡检
+        return False
+
+
 def _trail_stop_alerts(pos: list[dict], atr_map: dict) -> list[dict]:
     """移动止损提示：浮盈>10% **且**按 收盘−2.5×ATR14 算出的新止损确实高于现止损才报。
 
@@ -240,27 +258,6 @@ def _bench_close() -> float | None:
         return float(df["close"].iloc[-1]) if df is not None and len(df) else None
     except Exception:                               # noqa: BLE001
         return None
-
-
-def _otc_navs(state: dict) -> dict:
-    """场外持仓的累计净值序列：{code: [(date, value), ...]}（升序）。
-
-    用累计净值而不是单位净值：分红/拆分会把单位净值压低，用单位净值算收益系统性偏低。
-    取不到就跳过（沿用账本里的 nav/nav_date），失败不拖垮巡检。
-    """
-    out = {}
-    for code in sorted(str(c) for c in (state.get(otc_book.HOLD_KEY) or {})):
-        try:
-            df = datasource.fetch_fund_nav_history(otc_book.short_code(code), "累计净值走势")
-        except Exception:                           # noqa: BLE001 - 取不到就沿用旧净值
-            continue
-        if df is None or len(df) == 0:
-            continue
-        try:
-            out[code] = [(str(d)[:10], float(v)) for d, v in zip(df["date"], df["value"])]
-        except (KeyError, TypeError, ValueError):
-            continue
-    return out
 
 
 def _apply_dividends(st: dict, today: str) -> None:
@@ -307,12 +304,10 @@ def mark_daily(ledger: str, today: str) -> dict | None:
     # 场外持仓：决策日才刷新的话，净值会陈旧一周（巡检天天报「场外净值陈旧」）；
     # 这里每个工作日顺手刷一次累计净值，取不到就沿用旧值，不影响盯市。
     if st.get(otc_book.HOLD_KEY):
-        navs = _otc_navs(st)
-        if navs:
-            try:
-                otc_book.mark(st, navs)
-            except Exception:                   # noqa: BLE001 - 场外净值坏了不拖垮盯市
-                pass
+        try:
+            otc_book.refresh_navs(st, today)    # 与 paper_exec 同一入口：两条结算路径不能各刷各的
+        except Exception:                   # noqa: BLE001 - 场外净值坏了不拖垮盯市
+            pass
     prior = [n for n in (st.get("nav") or []) if n.get("date") < today]
     entry = paper.settle(st, today, closes, _bench_close())
     paper.save(st, _state_path(ledger))   # 必须写回本账本文件，不能落默认账本
@@ -398,11 +393,16 @@ def check_ledger(ledger: str, today: str) -> dict:
                     "detail": (f"最新净值日 {r['nav_date']}，已 {age} 个交易日没更新"
                                + ("（日历缺失，按自然日计）" if nat_fallback else "")),
                     "action": "净值缺失时影账不编价格（挂单保持 pending），先查数据源再决策"})
-            if int(r.get("hold_days") or 0) < 90 and float(r.get("amount") or 0) > 0:
+            # 2026-11-25（A 类）：条件从「持有 <90 天」改为「**实测费率 >0**」。
+            # 旧写法对 011984 这种「满 7 天即 0%」的产品会误报「赎回费窗口」，把「随时可赎」
+            # 说成「别动」。现在只看实测档；费表取不到时 otc_book 退回 1.5% 假设，条件仍成立。
+            _rf = float(r.get("redeem_fee") or 0)
+            if _rf > 0 and float(r.get("amount") or 0) > 0:
                 otc_alerts.append({
                     "kind": "场外赎回费窗口", "level": "低", "code": r["code"], "name": r["name"],
-                    "detail": f"持有 {r['hold_days']} 天（<90 天档费率 {float(r.get('redeem_fee') or 0) * 100:.2f}%）",
-                    "action": "不急用就拿满 90 天，赎回费降到 0"})
+                    "detail": (f"持有 {r['hold_days']} 天，赎回费 {_rf * 100:.2f}%"
+                               f"（{r.get('redeem_fee_basis') or '口径未知'}）"),
+                    "action": "不急用就等费率降到 0 再赎；若急着用，这笔费用要算进成本"})
     except Exception as e:                          # noqa: BLE001 - 巡检不能因影账异常而崩
         out["notes"].append(f"场外影账算不出：{type(e).__name__}: {e}")
     equity_mv = round(mv, 2)                        # 权益层市值（不含场外 R2 腿）：行业集中度分母
@@ -441,7 +441,11 @@ def check_ledger(ledger: str, today: str) -> dict:
     # 4) 行业集中度（分母 = 权益层市值，与技能口径一致）
     if pos:
         try:
-            conc = industry.concentration(pos, cap=float(config.EXEC.get("max_industry") or 0.25),
+            # 宽基/策略 ETF 不占行业额度（见 config.PAPER 行业注释），本身也没有行业字段：
+            # 必须排除在行业集中度口径外，否则会被当成「未分类」误报映射失效
+            # （2026-11-23 A 类修复：上证50ETF 占权益 22.3% 触发「行业映射缺失」中危）。
+            conc = industry.concentration([p for p in pos if not _is_broad_etf(p)],
+                                          cap=float(config.EXEC.get("max_industry") or 0.25),
                                           base=equity_mv or None)
             for r in conc.get("violated") or []:
                 out["alerts"].append({
@@ -513,7 +517,7 @@ def check_ledger(ledger: str, today: str) -> dict:
 
 # ------------------------------------------------------------------ 数据新鲜度
 # 阈值按「多久本该重跑一次」定，不是拍脑袋（2026-10-31 排班改定后重算）：
-#   决策日产物（候选/计划/快照/事件面）= 每周六一次 → 最长正常间隔 7 天，留 1 天缓冲取 8；
+#   决策日产物（候选/计划/快照/事件面）= 每周两次（周三/周六） → 最长正常间隔 4 天，仍取 8 天缓冲（覆盖长假）；
 #   行业映射 30 天、宏观 32 天（月度口径）。
 WATCH = [
     ("stage1_candidates.csv", "选股候选", 8),
@@ -1190,13 +1194,13 @@ def _gap(a, b) -> str:
 
 
 def render_md(res: dict, brief: bool = False) -> str:
-    """巡检 md。brief=True 只出「持仓体检 + 要处理」两节（日常）；False 出四节（有告警或周六汇总）。"""
+    """巡检 md。brief=True 只出「持仓体检 + 要处理」两节（日常）；False 出四节（有告警或决策日汇总）。"""
     L = [f"# 持仓巡检 {res['date']}", "",
          f"> 纯代码生成（0 token）· 生成于 {res['generated_at']} · 基准日 {res['date']}（最近一个交易日）",
          f"> 命中 {res['n_alerts']} 条，其中高优先级 {res['n_high']} 条。",
-         "> 只报告不调仓；要不要为明天开盘做动作，由 Lead 判断。", ""]
+         "> 只报告不调仓：除止损价被击穿（或熔断）由挂着的条件单撮合外，其余告警留到决策日处理。", ""]
     if brief:
-        L.append("> 日常简报：只看「体检」与「要处理」。周一到周五的汇总在周六 `out/patrol_weekly_*.md`。")
+        L.append("> 日常简报：只看「体检」与「要处理」。周一到周五的汇总在 `out/patrol_weekly_*.md`。")
         L.append("")
 
     # ---- 一、持仓体检（每天只需要看这一节）----
@@ -1227,15 +1231,17 @@ def render_md(res: dict, brief: bool = False) -> str:
         otc_rows = ((one.get("otc") or {}).get("rows") or [])
         if otc_rows:
             L.append("")
-            L.append(f"**{one['ledger']} · 场外 R2**（{len(otc_rows)} 只，T+1 确认、不足 90 天赎回按 1.5%）")
+            L.append(f"**{one['ledger']} · 场外 R2**（{len(otc_rows)} 只，T+1 确认；"
+                     f"赎回费按实际持有天数取实测档，费表取不到才按 1.5% 最严档假设）")
             L.append("")
-            L.append("| 代码 | 名称 | 投入 | 净值日 | 持有天数 | 赎回费 |")
-            L.append("|---|---|---|---|---|---|")
+            L.append("| 代码 | 名称 | 投入 | 净值日 | 持有天数 | 赎回费 | 口径 |")
+            L.append("|---|---|---|---|---|---|---|")
             for r in otc_rows:
                 L.append(f"| {r.get('code') or ''} | {(r.get('name') or '')[:9]} | "
                          f"{float(r.get('amount') or 0):,.0f} | {r.get('nav_date') or '—'} | "
                          f"{int(r.get('hold_days') or 0)} | "
-                         f"{float(r.get('redeem_fee') or 0) * 100:.2f}% |")
+                         f"{float(r.get('redeem_fee') or 0) * 100:.2f}% | "
+                         f"{r.get('redeem_fee_basis') or '—'} |")
                 n_pos += 1
         if not pos and not otc_rows:
             L.append(f"- `{one['ledger']}`：空仓（现金 {one.get('cash', 0):,.2f}）")
@@ -1327,7 +1333,7 @@ def main() -> int:
     ap.add_argument("--no-write", action="store_true", help="只打印，不写文件")
     ap.add_argument("--json", action="store_true", help="打印 JSON")
     ap.add_argument("--full-md", action="store_true",
-                    help="即使无告警也写完整四节（周六汇总前手动跑一次用）")
+                    help="即使无告警也写完整四节（决策日汇总前手动跑一次用）")
     ap.add_argument("--brief", action="store_true",
                     help="只打印三行简报（20:00 巡检任务直接引用；仍写盘）")
     a = ap.parse_args()

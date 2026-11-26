@@ -12,7 +12,7 @@ data\shared\snapshots\<date>\manifest.json.
 Division of labour (do not blur it):
 - This script FETCHES DATA ONLY. It never computes or writes any ledger.
 - The ledger lives with the skill and is settled by the 20:00 DSH patrol session:
-    invest: %USERPROFILE%\.dsh\skills\invest\ledger\state_50k.json (patrol.py --date auto)
+    invest: D:\skills\invest\ledger\state_50k.json (patrol.py --date auto)
 - Saturday 20:00 decision day uses the weekdays' fetched data; it does not re-fetch here.
 
 Design:
@@ -22,9 +22,9 @@ Design:
   would bypass the shared cache (that is exactly the old double-fetch/timeout failure mode).
 - The skill uses A_SHARE_WORKDIR, so its out/paper state stays isolated; only cache/ is shared
   through the junction.
-- invest workdir = %USERPROFILE%\.dsh\skills\invest\stock\data\invest holds cache/out only; the ledger is outside it (skill folder).
-- PYTHONPATH includes %USERPROFILE%\.dsh\skills\invest\stock so the skill (and prefetch/prune) can `import stock`.
-  (Do NOT use a drive root as PYTHONPATH: it exposes the install folder as a namespace package and shadows the real one.)
+- invest workdir = D:\skills\invest\stock\data\invest holds cache/out only; the ledger is outside it (skill folder).
+- PYTHONPATH includes D:\skills\invest\stock so the skill (and prefetch/prune) can `import stock`.
+  (Do NOT use D:\ : it exposes the D:\skills\invest\stock folder as a namespace package and shadows the real one.)
 - 0 token: pure python scripts, no LLM, no session.
 - -Root is for rehearsal only: shared cache becomes <Root>\shared, workdir <Root>\invest.
 - stdout/stderr per step to disk; summary to last_run.json; one history line appended.
@@ -61,7 +61,7 @@ param(
 $ErrorActionPreference = 'Continue'
 $stockHome = Split-Path -Parent $PSScriptRoot
 $py = Join-Path $stockHome '.venv\Scripts\python.exe'
-$skillsRoot = Join-Path $env:USERPROFILE '.dsh\skills'
+$skillsRoot = 'D:\skills'
 
 
 if ($Root) {
@@ -120,7 +120,7 @@ $env:TQDM_DISABLE = '1'
 if ($env:PYTHONPATH) { $env:PYTHONPATH = "$stockHome;$env:PYTHONPATH" } else { $env:PYTHONPATH = $stockHome }
 $env:STOCK_HOME = $stockHome
 # stock.cache provenance / OUT_DIR must follow the run root too (a -Root rehearsal must never write
-# %USERPROFILE%\.dsh\skills\invest\stock\data\out; stock/config.py reads OUT_DIR from STOCK_OUT_DIR).
+# D:\skills\invest\stock\data\out; stock/config.py reads OUT_DIR from STOCK_OUT_DIR).
 $env:STOCK_OUT_DIR = $outDir
 if ($Root) {
     # rehearsal: never touch production data\shared

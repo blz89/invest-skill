@@ -34,6 +34,7 @@ SUITES = [
     ("_selftest_regime_probe.py", "数据：熊市确认探针"),
     ("_selftest_plan.py", "排名篮子/上限/回滚/新闻闸"),
     ("_selftest_etf.py", "ETF 代码前缀/连续失败护栏（2026-11-16 bj 前缀事故）"),
+    ("_selftest_codes.py", "代码归一（短代码补零回归，2026-11-26）"),
     ("_selftest_paper.py", "撮合/止损/结算/现金层/回滚"),
     ("_selftest_risk.py", "R1–R5 定级与组合评审"),
     ("_selftest_review.py", "记分卡风险组合：场外逐只计入/单只上限回归"),
@@ -44,6 +45,7 @@ SUITES = [
     ("_selftest_preflight.py", "决策日第 3 步预检（数据日期/本金/成功率/日摘要）"),
     ("_selftest_snapshot.py", "L1 交接契约快照"),
     ("_selftest_layers.py", "行业/情绪/宏观三层"),
+    ("_selftest_news_eval.py", "事件面/政策面事后命中率（纯离线）"),
     ("_selftest_fund.py", "基金复算与交叉校验"),
     ("_selftest_pit.py", "PIT 时点正确性"),
     ("_selftest_cninfo.py", "巨潮公告扫描"),
@@ -56,6 +58,7 @@ SUITES = [
     ("_selftest_billing.py", "计费快照差额/缺快照回落"),
     ("_selftest_breakdown.py", "收益拆解（权益/场外/现金）与周报/月报接线"),
     ("_selftest_cash_sleeve.py", "半流动性货基池切片/逆回购脉冲择时"),
+    ("_selftest_all.py", "自检汇总器/套件清单一致性/启动规则文档"),
 ]
 NETWORK = [
     ("_selftest_fuyao.py", "同花顺数据层（要联网）"),
@@ -80,7 +83,7 @@ def count_of(text: str) -> int | None:
         if m:
             return int(m.group(1))
     if re.search(r"全部通过|结果[：:]\s*PASS|OK 全部通过", text):
-        return 0  # 通过但没报数（如 _selftest.py）
+        return None  # 通过但没报数：显示为 ?，不再伪装成 0 项
     return None
 
 

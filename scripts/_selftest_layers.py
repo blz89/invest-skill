@@ -162,6 +162,20 @@ def test_sentiment() -> None:
     check("brief 含标题", md.startswith("# 情绪层简报"))
     check("brief 声明不产生信号", "不产生买卖信号" in md)
 
+    # 就绪/过期判定（2026-11-25 加：空返回不能当成「今天 0 家」）
+    rd = sentiment.readiness(t, "2026-10-29", "2026-10-29")
+    eq("readiness 有样本即就绪", rd["ready"], True)
+    eq("readiness 未过期", rd["stale"], False)
+    empty = sentiment.market_temp([], [], [], [], [])
+    eq("readiness 全空未就绪", sentiment.readiness(empty, "", "2026-10-29")["ready"], False)
+    old = sentiment.readiness(t, "2026-10-01", "2026-10-29")
+    eq("readiness 过期天数", old["stale_days"], 28)
+    eq("readiness 过期标记", old["stale"], True)
+    md2 = sentiment.brief_md(empty, [], "2026-10-29 00:00:00")
+    check("brief 未就绪有警告", "数据未就绪" in md2)
+    md3 = sentiment.brief_md({**t, **old}, [], "2026-10-29 00:00:00")
+    check("brief 过期有警告", "数据过期" in md3)
+
 
 # ================================================================ 宏观层
 def test_macro() -> None:
