@@ -1,8 +1,8 @@
 {
  "files": {
   "README.md": {
-   "chars": 13333,
-   "fences": 8,
+   "chars": 14959,
+   "fences": 14,
    "flags": [
     "--also",
     "--annual",
@@ -68,13 +68,18 @@
     "--year"
    ],
    "heads": [
+    "Python 3.10+（开发机用 3.13）；取数接口层的依赖装在技能自带的 venv 里",
     "invest（投资）",
     "一键三阶段（首次全量约 5–8 分钟，之后走缓存几十秒）",
+    "一键安装（推荐；agent 可直接执行）",
     "五层结构",
     "出事怎么办（运维速查）",
     "利润与奖励口径",
     "历史回放与可复现性（回测只覆盖 ETF 承接层，个股层缺 PIT 数据）",
+    "安装",
+    "密钥与隐私",
     "快速开始",
+    "手动安装",
     "数据与产出落在哪",
     "文档体检（防膨胀）",
     "本部署执行者：Lead 主会话 + fresh 子代理（S1 研究 / S2 深取 / S3 复核 / S4 巡检；月报 T10 复盘）；Lead 跑规则引擎/行情单与 T9，验收用 --ingest",
@@ -92,6 +97,7 @@
     "限价",
     "涨停",
     "跌停",
+    "ST",
     "T+1",
     "行业",
     "篮子",
@@ -167,6 +173,7 @@
     "28",
     "3",
     "3.1",
+    "3.10",
     "3.13",
     "30",
     "33",
@@ -184,15 +191,18 @@
     "8.1"
    ],
    "scripts": [
-    "scripts/config.py"
+    "scripts/config.py",
+    "scripts/selftest_all.py"
    ],
    "ticks": [
     "$DSH_HOME/.dshw-usage.json",
     "$WORK_DIR/fuyao.key",
     "$env:A_SHARE_WORKDIR='D:\\some\\dir'",
+    "%USERPROFILE%\\.dsh\\skills\\invest",
     "& $py fund.py --health --n 6",
     "& $py selftest_all.py",
     "(1+r)^(365/该月实际运行天数) − 1",
+    "*.key",
     "*_em",
     "--capital",
     "--check",
@@ -209,7 +219,14 @@
     "--task-end --note 决策 <数据日>",
     "--task-end --note 每日巡检",
     "--update",
+    "-Dir <目录>",
+    "-Ref <分支或 tag>",
+    "-SkipTest",
+    ".env*",
+    ".gitignore",
     "50k",
+    "<本技能目录>",
+    "A_SHARE_WORKDIR",
     "CAPITAL.commission_ratio_block",
     "D:\\baostock\\",
     "D:\\skills\\invest",
@@ -222,6 +239,9 @@
     "EXEC.max_roundtrip_cost",
     "EXEC.min_risk_reward",
     "FUYAO_API_KEY",
+    "INVEST_SKILL_DIR",
+    "INVEST_SKILL_REF",
+    "INVEST_SKILL_SKIP_TEST=1",
     "PAPER[\"ledgers\"]",
     "PYTHONIOENCODING=utf-8",
     "README.md",
@@ -247,7 +267,7 @@
     "events[]",
     "events[].cost",
     "fund_*_em",
-    "git@github.com:blz89/invest-public.git",
+    "git@github.com:blz89/invest-skill.git",
     "housekeeping.py --year",
     "import fuyao",
     "ledger/",
@@ -268,10 +288,12 @@
     "paper/*.json",
     "paper_exec.py --ledger 50k --date <交易日> --dry-run",
     "patrol.py",
+    "pip install -e stock",
     "pip install -r requirements.txt",
     "plan.py",
     "prompts/*.md",
     "prompts/daily_patrol.md",
+    "pypdf",
     "python -m stock prefetch",
     "python cninfo.py --code 601058 --days 365",
     "python industry.py --refresh",
@@ -293,6 +315,7 @@
     "references/risk-review.md",
     "references/team-framework.md",
     "references/thresholds.md",
+    "requirements.txt",
     "review.py --ledger 50k --strict --annual",
     "review.py --strict",
     "rollback.py --ledger 50k --list",
@@ -301,19 +324,26 @@
     "run.py --capital 50000",
     "score.py",
     "scripts/config.py",
+    "scripts/selftest_all.py --fast",
     "selftest_all.py",
     "source=task-window",
     "spent_cny",
+    "stock/.venv",
+    "stock/.venv/",
     "stock/data/",
+    "stock/stock/endpoints/em.py",
     "team.py",
     "team.py --run-t8 --score-only --annual",
     "team.py --stage T9",
+    "token",
     "tools/doc_contract.json",
     "top_n",
+    "ut",
     "v1.3.0",
     "week_skill_cost",
     "weekly.py",
-    "weekly.py --ledger 50k --reuse"
+    "weekly.py --ledger 50k --reuse",
+    "~/.dsh/skills/invest"
    ]
   },
   "SKILL.md": {
@@ -4076,5 +4106,5 @@
    ]
   }
  },
- "generated_at": "2026-11-27 00:31:35"
+ "generated_at": "2026-11-27 00:44:05"
 }

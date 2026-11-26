@@ -56,8 +56,6 @@ stock\.venv\Scripts\python.exe -m pip install pypdf
 
 ---
 
----
-
 ## 快速开始
 
 > **只跑 5 万单账本**：`PAPER["ledgers"]` 只有 `50k`；四条定时任务（交易日 19:00 取数为 Windows 计划任务；巡检/决策/月报复盘为 DSH 调度，1 月 1 日自动切年报）与决策日步骤均为单账本；加账本先让用户拍板并改配置。
@@ -227,6 +225,6 @@ ledger/state_50k.json  5 万模拟盘账本（技能目录 ledger/，DSH 巡检�
 
 ## 版本库
 
-`git@github.com:blz89/invest-public.git`（SSH）· <https://github.com/blz89/invest-public>
+`git@github.com:blz89/invest-skill.git`（SSH）· <https://github.com/blz89/invest-skill>
 
 当前版本 **v1.3.0**（tag `v1.3.0`）。
